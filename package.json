@@ -1,0 +1,66 @@
+{
+  "name": "sqlite-graph-mcp",
+  "version": "0.1.0",
+  "description": "Zero-embedding code & spec graph MCP server: indexes a workspace into SQLite and answers 5-operator graph queries (find, walk, filter, minus, answer) over recursive CTEs.",
+  "author": "Inkwon Jung (https://github.com/developjik)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/developjik/sqlite-graph-mcp.git"
+  },
+  "homepage": "https://github.com/developjik/sqlite-graph-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/developjik/sqlite-graph-mcp/issues"
+  },
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "bin": {
+    "sqlite-graph-mcp": "dist/bin/cli.js",
+    "sqlite-graph": "dist/bin/cli.js"
+  },
+  "main": "dist/src/index.js",
+  "types": "dist/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "default": "./dist/src/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "pretest": "npm run build",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "start": "node dist/bin/cli.js serve",
+    "prepublishOnly": "npm run typecheck && npm run build && npm test"
+  },
+  "keywords": [
+    "mcp",
+    "sqlite",
+    "code-graph",
+    "knowledge-graph",
+    "recursive-cte",
+    "model-context-protocol",
+    "code-search",
+    "llm"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "better-sqlite3": "^11.10.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^20.19.9",
+    "typescript": "^5.9.3",
+    "vitest": "^2.1.9"
+  }
+}
