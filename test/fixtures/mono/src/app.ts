@@ -7,5 +7,6 @@ import ext from 'some-external';
 export function runApp(): string {
   void undeclaredPkg;
   void ext;
+  void libEntry;
   return `${sayHello()} ${SHARED}`;
 }

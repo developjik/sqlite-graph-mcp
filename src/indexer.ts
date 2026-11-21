@@ -2,6 +2,7 @@ import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import * as posix from 'node:path/posix';
 
+import { getAstEngine, parseFile, type AstEngine, type AstImport, type AstParse } from './ast.js';
 import { GraphStore, SCHEMA_VERSION, defaultDbPath } from './db.js';
 import type { EdgeType, IndexOptions, IndexStats, NodeKind } from './types.js';
 import {
@@ -126,6 +127,8 @@ interface PendingLink {
   imports?: ImportedNames;
   /** Already resolved workspace-relative target (alias / workspace package). */
   resolved?: string;
+  /** AST engine bindings with usage lines; drives usage-based references. */
+  ast?: AstImport;
 }
 
 interface PackageInfo {
@@ -148,7 +151,7 @@ export interface IndexResult {
  * The database is rebuilt in a single transaction, so a failure leaves the
  * previous graph untouched.
  */
-export function indexWorkspace(options: IndexOptions): IndexStats {
+export async function indexWorkspace(options: IndexOptions): Promise<IndexStats> {
   const started = Date.now();
   const root = resolve(options.root);
   if (!existsSync(root) || !statSync(root).isDirectory()) {
@@ -159,6 +162,7 @@ export function indexWorkspace(options: IndexOptions): IndexStats {
   const collected = collectFiles(root, options);
   const relPaths = new Set(collected.files.map((f) => f.rel));
   const aliasMap = loadAliasMap(root);
+  const astEngine = options.engine === 'heuristic' ? null : await getAstEngine();
 
   const nodes = new Map<string, ParsedNode>();
   const edges: ParsedEdge[] = [];
@@ -198,6 +202,7 @@ export function indexWorkspace(options: IndexOptions): IndexStats {
   const ctx: IndexContext = {
     relPaths,
     aliasMap,
+    astEngine,
     packages,
     pendingLinks,
     defaultExports,
@@ -336,6 +341,7 @@ export function indexWorkspace(options: IndexOptions): IndexStats {
         total: counts['edge:total'] ?? 0,
       },
       durationMs: Date.now() - started,
+      engine: astEngine ? 'ast' : 'heuristic',
       indexedAt: new Date().toISOString(),
     };
     return stats;
@@ -415,6 +421,8 @@ export function collectFiles(root: string, options: IndexOptions): CollectedFile
 export interface IndexContext {
   relPaths: Set<string>;
   aliasMap: AliasMap | null;
+  /** Loaded tree-sitter grammars; null → regex extraction. */
+  astEngine: AstEngine | null;
   packages: Map<string, PackageInfo>;
   pendingLinks: PendingLink[];
   defaultExports: Map<string, { line: number; text: string }>;
@@ -486,8 +494,9 @@ function indexManifest(rel: string, source: string, ctx: IndexContext): void {
   }
 }
 
+/** File node + tags, then engine dispatch (AST when available, else regexes). */
 function indexCodeFile(rel: string, source: string, ctx: IndexContext): void {
-  const { addNode, addEdge, upsertPackage, pendingLinks, aliasMap, relPaths, packages, defaultExports } = ctx;
+  const { addNode } = ctx;
   const fileKey = `file:${rel}`;
   const ext = posix.extname(rel).toLowerCase();
   const tags = ['code', ext.replace('.', '')];
@@ -506,6 +515,116 @@ function indexCodeFile(rel: string, source: string, ctx: IndexContext): void {
     tags,
     meta: { language: ext.replace('.', ''), size: source.length },
   });
+
+  if (ctx.astEngine) {
+    const parsed = parseFile(ctx.astEngine, source, ext);
+    if (parsed) {
+      indexCodeFileAst(rel, parsed, ctx);
+      return;
+    }
+  }
+  indexCodeFileHeuristic(rel, source, ctx);
+}
+
+/** Extra per-import payload: heuristic clause info and/or AST bindings. */
+interface ImportPayload {
+  imports?: ImportedNames;
+  ast?: AstImport;
+}
+
+/**
+ * Route one import specifier: relative → file, tsconfig alias → file,
+ * workspace-local package → depends_on + entry/subpath file, else external
+ * package. Shared by both engines so alias/monorepo behavior never diverges.
+ */
+function routeImport(
+  rel: string,
+  spec: string,
+  line: number,
+  payload: ImportPayload,
+  ctx: IndexContext,
+): void {
+  const { addEdge, upsertPackage, pendingLinks, aliasMap, relPaths, packages } = ctx;
+  const fileKey = `file:${rel}`;
+  const base = { fromKey: fileKey, fromPath: rel, target: spec, line, edge: 'imports' as const, ...payload };
+
+  if (spec.startsWith('.') || spec.startsWith('/')) {
+    pendingLinks.push(base);
+    return;
+  }
+
+  // tsconfig `paths` alias → a workspace file, not a package.
+  const aliased = aliasMap ? resolveAlias(aliasMap, spec, relPaths) : null;
+  if (aliased) {
+    pendingLinks.push({ ...base, resolved: aliased });
+    return;
+  }
+
+  const pkg = packageNameOf(spec);
+  if (!pkg || isBuiltin(spec)) return;
+  const info = packages.get(pkg);
+  if (info && info.manifests.size > 0) {
+    // Workspace-local package: link the package node and, when the entry or
+    // subpath resolves to an indexed file, an imports edge too.
+    addEdge(fileKey, `package:${pkg}`, 'depends_on', line);
+    const pkgDir = posix.dirname([...info.manifests][0] ?? rel);
+    const sub = spec.slice(pkg.length).replace(/^[\/\\]+/, '');
+    const bases = sub ? [`${pkgDir}/${sub}`] : [info.entry ? `${pkgDir}/${info.entry}` : null, `${pkgDir}/index`];
+    for (const b of bases) {
+      if (!b) continue;
+      const target = resolveFromRoot(b, relPaths);
+      if (target) {
+        pendingLinks.push({ ...base, resolved: target });
+        return;
+      }
+    }
+    return;
+  }
+  upsertPackage(pkg, { external: true });
+  addEdge(fileKey, `package:${pkg}`, 'depends_on', line);
+}
+
+/** AST extraction: parse-tree symbols and usage-based references. */
+function indexCodeFileAst(rel: string, parse: AstParse, ctx: IndexContext): void {
+  const { addNode, addEdge, pendingLinks, defaultExports } = ctx;
+  const fileKey = `file:${rel}`;
+  const ext = posix.extname(rel).toLowerCase();
+  const seenSpecs = new Set<string>();
+
+  for (const imp of parse.imports) {
+    const key = `${imp.spec}:${imp.line}`;
+    if (seenSpecs.has(key)) continue;
+    seenSpecs.add(key);
+    routeImport(rel, imp.spec, imp.line, { ast: imp }, ctx);
+  }
+
+  for (const sym of parse.symbols) {
+    const exported = sym.exported || parse.listedExports.has(sym.name);
+    const symbolKey = `symbol:${rel}#${sym.name}`;
+    addNode({
+      key: symbolKey,
+      kind: 'symbol',
+      name: sym.name,
+      path: rel,
+      line: sym.line,
+      content: snippet(sym.snippet, 300),
+      tags: exported ? ['symbol', 'exported', sym.kind] : ['symbol', sym.kind],
+      meta: { symbolKind: sym.kind, exported, language: ext.replace('.', '') },
+    });
+    addEdge(fileKey, symbolKey, 'defines', sym.line);
+    if (exported) addEdge(fileKey, symbolKey, 'exports', sym.line);
+  }
+
+  if (parse.defaultExport && !defaultExports.has(rel)) {
+    defaultExports.set(rel, parse.defaultExport);
+  }
+}
+
+/** Regex extraction: comment-masked scans, import-clause-based references. */
+function indexCodeFileHeuristic(rel: string, source: string, ctx: IndexContext): void {
+  const { addNode, addEdge, upsertPackage, pendingLinks, aliasMap, relPaths, packages, defaultExports } = ctx;
+  const fileKey = `file:${rel}`;
+  const ext = posix.extname(rel).toLowerCase();
 
   const masked = maskComments(source);
   const lineStarts = computeLineStarts(masked);
@@ -541,56 +660,7 @@ function indexCodeFile(rel: string, source: string, ctx: IndexContext): void {
         clauseGroup === 0 ? (lines[line - 1] ?? null) : null,
       );
 
-      if (spec.startsWith('.') || spec.startsWith('/')) {
-        pendingLinks.push({ fromKey: fileKey, fromPath: rel, target: spec, line, edge: 'imports', imports });
-        continue;
-      }
-
-      // tsconfig `paths` alias → a workspace file, not a package.
-      const aliased = aliasMap ? resolveAlias(aliasMap, spec, relPaths) : null;
-      if (aliased) {
-        pendingLinks.push({
-          fromKey: fileKey,
-          fromPath: rel,
-          target: spec,
-          line,
-          edge: 'imports',
-          imports,
-          resolved: aliased,
-        });
-        continue;
-      }
-
-      const pkg = packageNameOf(spec);
-      if (!pkg || isBuiltin(spec)) continue;
-      const info = packages.get(pkg);
-      if (info && info.manifests.size > 0) {
-        // Workspace-local package: link the package node and, when the entry
-        // or subpath resolves to an indexed file, an imports edge too.
-        addEdge(fileKey, `package:${pkg}`, 'depends_on', line);
-        const pkgDir = posix.dirname([...info.manifests][0] ?? rel);
-        const sub = spec.slice(pkg.length).replace(/^[\/\\]+/, '');
-        const bases = sub ? [`${pkgDir}/${sub}`] : [info.entry ? `${pkgDir}/${info.entry}` : null, `${pkgDir}/index`];
-        for (const b of bases) {
-          if (!b) continue;
-          const target = resolveFromRoot(b, relPaths);
-          if (target) {
-            pendingLinks.push({
-              fromKey: fileKey,
-              fromPath: rel,
-              target: spec,
-              line,
-              edge: 'imports',
-              imports,
-              resolved: target,
-            });
-            break;
-          }
-        }
-        continue;
-      }
-      upsertPackage(pkg, { external: true });
-      addEdge(fileKey, `package:${pkg}`, 'depends_on', line);
+      routeImport(rel, spec, line, { imports }, ctx);
     }
   }
 
@@ -740,7 +810,8 @@ function resolveLink(link: PendingLink, headingKeys: Set<string>, refs: Referenc
     const target = link.resolved ?? resolveRelative(link.fromPath, raw, relPaths);
     if (target) {
       addEdge(link.fromKey, `file:${target}`, 'imports', link.line);
-      addReferenceEdges(link, target, refs);
+      if (link.ast) addAstReferenceEdges(link.ast, link.fromKey, target, refs);
+      else addReferenceEdges(link, target, refs);
     }
     return;
   }
@@ -788,6 +859,39 @@ function addReferenceEdges(link: PendingLink, targetRel: string, refs: Reference
   if (imports.namespace) {
     for (const symbol of refs.exportedByFile.get(targetRel) ?? []) {
       refs.addEdge(link.fromKey, symbol.key, 'references', link.line);
+    }
+  }
+}
+
+/**
+ * Usage-based `references` edges from the AST engine: one edge per imported
+ * symbol the file actually uses, cited at the first usage line (never at the
+ * import line), plus `export *` re-exports referencing every export.
+ */
+function addAstReferenceEdges(
+  ast: AstImport,
+  fromKey: string,
+  targetRel: string,
+  refs: ReferenceContext,
+): void {
+  for (const binding of ast.named) {
+    if (binding.usedAtLine === null) continue; // imported but never used
+    const key = `symbol:${targetRel}#${binding.imported}`;
+    if (refs.nodes.has(key)) refs.addEdge(fromKey, key, 'references', binding.usedAtLine);
+  }
+  if (ast.defaultLocal && ast.defaultLocal.usedAtLine !== null) {
+    const symbol = defaultExportSymbol(targetRel, refs);
+    if (symbol) refs.addEdge(fromKey, symbol.key, 'references', ast.defaultLocal.usedAtLine);
+  }
+  if (ast.exportAllLine !== null) {
+    for (const symbol of refs.exportedByFile.get(targetRel) ?? []) {
+      refs.addEdge(fromKey, symbol.key, 'references', ast.exportAllLine);
+    }
+  }
+  if (ast.namespaceLocal) {
+    for (const [prop, line] of ast.namespaceLocal.props) {
+      const key = `symbol:${targetRel}#${prop}`;
+      if (refs.nodes.has(key)) refs.addEdge(fromKey, key, 'references', line);
     }
   }
 }

@@ -25,11 +25,18 @@ export function tempDir(prefix = 'sqlite-graph'): string {
   return mkdtempSync(join(base, `${prefix}-`));
 }
 
-/** Index the fixture workspace into a throwaway database. */
-export function createFixtureGraph(options: { dbPath?: string; root?: string } = {}): FixtureGraph {
+export async function createFixtureGraph(options: {
+  dbPath?: string;
+  root?: string;
+  engine?: 'ast' | 'heuristic';
+} = {}): Promise<FixtureGraph> {
   const dir = options.dbPath ? dirname(options.dbPath) : tempDir();
   const dbPath = options.dbPath ?? join(dir, 'index.db');
-  const stats = indexWorkspace({ root: options.root ?? fixtureRoot, dbPath });
+  const stats = await indexWorkspace({
+    root: options.root ?? fixtureRoot,
+    dbPath,
+    engine: options.engine,
+  });
   const store = new GraphStore(dbPath);
   return {
     dir,

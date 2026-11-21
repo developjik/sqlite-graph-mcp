@@ -12,7 +12,7 @@ import { filterNodes, findNodes, findOrphans, toEdgeViews, toNodeView, walkNodes
 import { EDGE_TYPES, NODE_KINDS, type IndexStats } from './types.js';
 
 export const SERVER_NAME = 'sqlite-graph-mcp';
-export const SERVER_VERSION = '0.2.0';
+export const SERVER_VERSION = '0.3.0';
 
 export interface GraphServerOptions {
   /** Workspace root to index. Defaults to `process.cwd()`. */
@@ -35,7 +35,8 @@ export interface GraphServerHandle {
     root?: string;
     ignore?: string[];
     maxFiles?: number;
-  }) => IndexStats;
+    engine?: 'ast' | 'heuristic';
+  }) => Promise<IndexStats>;
   close: () => void;
 }
 
@@ -72,34 +73,37 @@ export function createGraphServer(options: GraphServerOptions = {}): GraphServer
     return store;
   };
 
-  const index = (indexOptions?: {
+  const index = async (indexOptions?: {
     force?: boolean;
     root?: string;
     ignore?: string[];
     maxFiles?: number;
-  }): IndexStats => {
+    engine?: 'ast' | 'heuristic';
+  }): Promise<IndexStats> => {
     const targetRoot = indexOptions?.root ? resolve(indexOptions.root) : root;
     if (store) {
       store.close();
       store = null;
     }
-    const stats = indexWorkspace({
+    const stats = await indexWorkspace({
       root: targetRoot,
       dbPath,
       ignore: indexOptions?.ignore,
       maxFiles: indexOptions?.maxFiles,
+      engine: indexOptions?.engine,
     });
     log(
-      `indexed ${stats.files} files → ${stats.nodes.total} nodes, ${stats.edges.total} edges in ${stats.durationMs}ms`,
+      `indexed ${stats.files} files → ${stats.nodes.total} nodes, ${stats.edges.total} edges ` +
+        `(${stats.engine} engine) in ${stats.durationMs}ms`,
     );
     return stats;
   };
 
-  const ensureIndexed = (): GraphStore => {
+  const ensureIndexed = async (): Promise<GraphStore> => {
     const handle = openStore();
     if (!autoIndex) return handle;
     if (!existsSync(dbPath) || handle.countNodes() === 0) {
-      index();
+      await index();
       return openStore();
     }
     return handle;
@@ -125,21 +129,24 @@ export function createGraphServer(options: GraphServerOptions = {}): GraphServer
         'Scan the workspace for .ts/.tsx/.js/.jsx/.md files and package.json manifests, and build the ' +
         'SQLite graph at .sqlite-graph/index.db (nodes: file, symbol, heading, package; edges: imports, ' +
         'exports, defines, links_to, depends_on, references). tsconfig paths aliases and workspace-local ' +
-        'packages resolve to real files. Safe to re-run: it rebuilds atomically.',
+        'packages resolve to real files. The default tree-sitter (WASM AST) engine grounds references ' +
+        'in identifier usage; the regex heuristic engine is a fallback. Safe to re-run: it rebuilds atomically.',
       inputSchema: {
         root: z.string().optional().describe('Workspace directory to index (defaults to the server root).'),
         force: z.boolean().optional().describe('Accepted for symmetry; indexing always rebuilds.'),
         ignore: z.array(z.string()).optional().describe('Extra directory or file names to skip.'),
+        engine: z.enum(['ast', 'heuristic']).optional().describe('Extraction engine. Default: ast (tree-sitter WASM).'),
         maxFiles: z.number().int().min(1).max(50000).optional(),
       },
     },
     async (args) => {
       try {
-        const stats = index({
+        const stats = await index({
           force: args.force,
           root: args.root,
           ignore: args.ignore,
           maxFiles: args.maxFiles,
+          engine: args.engine,
         });
         return jsonContent({ ok: true, ...stats, hint: 'Use graph_find or graph_plan next.' });
       } catch (error) {
@@ -166,7 +173,7 @@ export function createGraphServer(options: GraphServerOptions = {}): GraphServer
     },
     async (args) => {
       try {
-        const graph = ensureIndexed();
+        const graph = await ensureIndexed();
         const found = findNodes(graph, args.query, { kind: args.kind, limit: args.limit });
         return jsonContent({
           count: found.nodes.length,
@@ -203,7 +210,7 @@ export function createGraphServer(options: GraphServerOptions = {}): GraphServer
     },
     async (args) => {
       try {
-        const graph = ensureIndexed();
+        const graph = await ensureIndexed();
         const walked = walkNodes(graph, args.start, {
           edgeType: args.edgeType,
           direction: args.direction,
@@ -241,7 +248,7 @@ export function createGraphServer(options: GraphServerOptions = {}): GraphServer
     },
     async (args) => {
       try {
-        const graph = ensureIndexed();
+        const graph = await ensureIndexed();
         const plan = parsePlan(args.plan);
         if (args.limit !== undefined) plan.limit = args.limit;
         const answer = executePlan(graph, plan);
@@ -268,7 +275,7 @@ export function createGraphServer(options: GraphServerOptions = {}): GraphServer
     },
     async (args) => {
       try {
-        const graph = ensureIndexed();
+        const graph = await ensureIndexed();
         const result = findOrphans(graph, {
           includeEntries: args.includeEntries,
           includeTests: args.includeTests,
@@ -303,7 +310,7 @@ export function createGraphServer(options: GraphServerOptions = {}): GraphServer
     },
     async (args) => {
       try {
-        const graph = ensureIndexed();
+        const graph = await ensureIndexed();
         const result = filterNodes(graph, args.ids, {
           kind: args.kind,
           notKind: args.notKind,

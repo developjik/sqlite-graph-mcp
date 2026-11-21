@@ -9,14 +9,13 @@ afterEach(() => {
   graph?.cleanup();
   graph = null;
 });
-
-function setup(): FixtureGraph {
-  graph = createFixtureGraph();
+async function setup(): Promise<FixtureGraph> {
+  graph = await createFixtureGraph();
   return graph;
 }
 
 describe('plan parsing', () => {
-  it('parses a pipeline with options and a quoted query', () => {
+  it('parses a pipeline with options and a quoted query', async () => {
     const plan = parseDsl('find "graph index" kind=symbol limit=5 | walk type=imports,defines dir=in depth=2');
     expect(plan.steps).toHaveLength(2);
     const find = plan.steps[0];
@@ -35,7 +34,7 @@ describe('plan parsing', () => {
     }
   });
 
-  it('parses filter options into a declarative predicate', () => {
+  it('parses filter options into a declarative predicate', async () => {
     const plan = parseDsl('find "*" | filter kind=file path=src/** tag=code limit=7');
     const filter = plan.steps[1];
     expect(filter.op).toBe('filter');
@@ -49,7 +48,7 @@ describe('plan parsing', () => {
     }
   });
 
-  it('parses minus with a nested find', () => {
+  it('parses minus with a nested find', async () => {
     const plan = parseDsl('find "*" kind=file | minus find "*.test.ts"');
     const minus = plan.steps[1];
     expect(minus.op).toBe('minus');
@@ -59,14 +58,14 @@ describe('plan parsing', () => {
     }
   });
 
-  it('accepts JSON plans and step arrays', () => {
+  it('accepts JSON plans and step arrays', async () => {
     const fromObject = parsePlan({ steps: [{ op: 'find', query: 'walker', kind: 'symbol' }], limit: 3 });
     expect(fromObject.limit).toBe(3);
     const fromArray = parsePlan([{ op: 'find', query: 'emoji' }]);
     expect(fromArray.steps).toHaveLength(1);
   });
 
-  it('rejects malformed plans with actionable messages', () => {
+  it('rejects malformed plans with actionable messages', async () => {
     expect(() => parseDsl('bogus foo')).toThrow(/Unknown plan op "bogus"/);
     expect(() => parseDsl('find "unterminated')).toThrow(/Unterminated quote/);
     expect(() => parseDsl('find a | walk dir=sideways')).toThrow(/walk dir must be out, in, or both/);
@@ -75,14 +74,14 @@ describe('plan parsing', () => {
     expect(() => parseDsl('find a | minus')).toThrow(/minus needs a sub-plan/);
   });
 
-  it('keeps quoted phrases together when tokenizing', () => {
+  it('keeps quoted phrases together when tokenizing', async () => {
     expect(tokenize('find "graph index" kind=file')).toEqual(['find', 'graph index', 'kind=file']);
   });
 });
 
 describe('answer (operator 5)', () => {
-  it('runs find → walk → filter and returns citations', () => {
-    const { store } = setup();
+  it('runs find → walk → filter and returns citations', async () => {
+    const { store } = await setup();
     const answer = executePlan(
       store,
       'find "walker" kind=symbol | walk type=defines dir=in depth=1 | filter kind=file',
@@ -94,8 +93,8 @@ describe('answer (operator 5)', () => {
     expect(answer.explain).toHaveLength(3);
   });
 
-  it('returns the edges it traversed as evidence', () => {
-    const { store } = setup();
+  it('returns the edges it traversed as evidence', async () => {
+    const { store } = await setup();
     const answer = executePlan(
       store,
       'find "index.ts" kind=file | walk type=imports dir=out depth=1',
@@ -106,16 +105,16 @@ describe('answer (operator 5)', () => {
     expect(answer.edges.every((edge) => edge.citation !== null)).toBe(true);
   });
 
-  it('supports minus to exclude tests from a file list', () => {
-    const { store } = setup();
+  it('supports minus to exclude tests from a file list', async () => {
+    const { store } = await setup();
     const answer = executePlan(store, 'find "*" kind=file | minus find "*.test.ts"');
     const paths = answer.nodes.map((node) => node.path);
     expect(paths).not.toContain('src/graph/walker.test.ts');
     expect(paths).toContain('src/legacy.ts');
   });
 
-  it('accepts a JSON step plan with an explicit walk start', () => {
-    const { store } = setup();
+  it('accepts a JSON step plan with an explicit walk start', async () => {
+    const { store } = await setup();
     const start = idsOfKeys(store, ['file:src/graph/cycle-a.ts']);
     const answer = executePlan(store, {
       steps: [
@@ -130,21 +129,21 @@ describe('answer (operator 5)', () => {
     expect(answer.nodes[0]?.depth).toBeDefined();
   });
 
-  it('truncates large answers and reports it', () => {
-    const { store } = setup();
+  it('truncates large answers and reports it', async () => {
+    const { store } = await setup();
     const answer = executePlan(store, { steps: [{ op: 'find', query: '*' }], limit: 2 });
     expect(answer.nodes).toHaveLength(2);
     expect(answer.count).toBeGreaterThan(2);
     expect(answer.truncated).toBe(true);
   });
 
-  it('explains why a walk cannot start from nothing', () => {
-    const { store } = setup();
+  it('explains why a walk cannot start from nothing', async () => {
+    const { store } = await setup();
     expect(() => executePlan(store, 'walk type=imports')).toThrow(/walk needs a start set/);
   });
 
-  it('produces the same nodes as the underlying operators', () => {
-    const { store } = setup();
+  it('produces the same nodes as the underlying operators', async () => {
+    const { store } = await setup();
     const answer = executePlan(store, 'find "greet" kind=symbol');
     const direct = findNodes(store, 'greet', { kind: 'symbol' });
     expect(answer.nodes.map((n) => n.id)).toEqual(direct.nodes.map((n) => n.id));

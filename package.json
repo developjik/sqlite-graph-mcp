@@ -1,6 +1,7 @@
 {
   "name": "@developjik/sqlite-graph-mcp",
-  "version": "0.2.0",
+  "version": "0.3.0",
+  "mcpName": "io.github.developjik/sqlite-graph-mcp",
   "description": "Zero-embedding code & spec graph MCP server: indexes a workspace into SQLite and answers 5-operator graph queries (find, walk, filter, minus, answer) over recursive CTEs.",
   "author": "Inkwon Jung (https://github.com/developjik)",
   "repository": {
@@ -35,6 +36,7 @@
     "dist",
     "README.md",
     "README.ko.md",
+    "vendor",
     "LICENSE"
   ],
   "scripts": {
@@ -42,6 +44,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "pretest": "npm run build",
     "test": "vitest run",
+    "vendor:wasm": "cp node_modules/tree-sitter-wasms/out/tree-sitter-typescript.wasm node_modules/tree-sitter-wasms/out/tree-sitter-tsx.wasm vendor/",
     "test:watch": "vitest",
     "start": "node dist/bin/cli.js serve",
     "prepublishOnly": "npm run typecheck && npm run build && npm test"
@@ -59,11 +62,13 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",
     "better-sqlite3": "^11.10.0",
+    "web-tree-sitter": "0.25.4",
     "zod": "^3.25.76"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^20.19.9",
+    "tree-sitter-wasms": "^0.1.13",
     "typescript": "^5.9.3",
     "vitest": "^2.1.9"
   }

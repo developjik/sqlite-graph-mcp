@@ -1,0 +1,20 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.developjik/sqlite-graph-mcp",
+  "description": "Zero-embedding code & spec graph over SQLite with file:line citations for every answer.",
+  "repository": {
+    "url": "https://github.com/developjik/sqlite-graph-mcp",
+    "source": "github"
+  },
+  "version": "0.3.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@developjik/sqlite-graph-mcp",
+      "version": "0.3.0",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}
