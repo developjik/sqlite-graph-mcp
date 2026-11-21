@@ -46,5 +46,26 @@ jobs:
       - name: Authenticate to MCP Registry
         run: ./mcp-publisher login github-oidc
 
+
+      - name: Wait for the npm release to propagate
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            if npm view @developjik/sqlite-graph-mcp@${GITHUB_REF_NAME#v} version >/dev/null 2>&1; then
+              echo "npm has ${GITHUB_REF_NAME#v}"
+              exit 0
+            fi
+            echo "waiting for npm to list ${GITHUB_REF_NAME#v} ($i/30)"
+            sleep 10
+          done
+          echo "npm never listed the release; publishing will likely fail" >&2
+
       - name: Publish server to MCP Registry
-        run: ./mcp-publisher publish
+        run: |
+          set -euo pipefail
+          for i in 1 2 3; do
+            if ./mcp-publisher publish; then exit 0; fi
+            echo "publish attempt $i failed; retrying in 30s" >&2
+            sleep 30
+          done
+          ./mcp-publisher publish
