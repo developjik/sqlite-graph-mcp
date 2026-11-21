@@ -1,6 +1,6 @@
 # sqlite-graph-mcp
 
-[![CI](https://github.com/developjik/sqlite-graph-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/developjik/sqlite-graph-mcp/actions/workflows/ci.yml)
+**한국어 문서: [README.ko.md](README.ko.md)** · English documentation
 
 **A code & spec graph your AI agent can actually cite** — no embeddings, no Docker, no Neo4j, no API key.
 One SQLite file, five operators, `file:line` evidence for every answer.
