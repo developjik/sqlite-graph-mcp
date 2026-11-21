@@ -28,6 +28,7 @@ interface ParsedArgs {
 
 const VALUE_FLAGS = new Set([
   'root',
+  'engine',
   'db',
   'kind',
   'limit',
@@ -79,11 +80,15 @@ function dbPathFor(root: string, flags: Record<string, string | boolean>): strin
   return db ? resolve(db) : defaultDbPath(root);
 }
 
-function openStore(root: string, flags: Record<string, string | boolean>): GraphStore {
+async function openStore(root: string, flags: Record<string, string | boolean>): Promise<GraphStore> {
   const dbPath = dbPathFor(root, flags);
   if (!existsSync(dbPath)) {
     process.stderr.write(`[${SERVER_NAME}] no graph at ${dbPath}; indexing ${root} first…\n`);
-    indexWorkspace({ root, dbPath });
+    await indexWorkspace({
+      root,
+      dbPath,
+      engine: flags.engine === 'heuristic' ? 'heuristic' : undefined,
+    });
   }
   return new GraphStore(dbPath);
 }
@@ -170,17 +175,18 @@ async function main(argv: string[]): Promise<number> {
     }
     case 'index': {
       const target = positional[0] ? resolve(positional[0]) : root;
-      const stats = indexWorkspace({
+      const stats = await indexWorkspace({
         root: target,
         dbPath: dbPathFor(target, flags),
         ignore: typeof flags.ignore === 'string' ? flags.ignore.split(',') : undefined,
+        engine: flags.engine === 'heuristic' ? 'heuristic' : undefined,
       });
       if (json) {
         process.stdout.write(`${JSON.stringify(stats, null, 2)}\n`);
       } else {
         const { nodes, edges } = stats;
         process.stdout.write(
-          `Indexed ${stats.files} files in ${stats.durationMs}ms → ${stats.dbPath}\n` +
+          `Indexed ${stats.files} files in ${stats.durationMs}ms (${stats.engine} engine) → ${stats.dbPath}\n` +
             `  nodes: ${nodes.total} (file ${nodes.file}, symbol ${nodes.symbol}, heading ${nodes.heading}, package ${nodes.package})\n` +
             `  edges: ${edges.total} (imports ${edges.imports}, exports ${edges.exports}, defines ${edges.defines}, links_to ${edges.links_to}, depends_on ${edges.depends_on}, references ${edges.references})\n`,
         );
@@ -190,7 +196,7 @@ async function main(argv: string[]): Promise<number> {
     case 'find': {
       const query = positional.join(' ');
       if (!query) throw new Error('find needs a query: sqlite-graph-mcp find "walkNodes"');
-      const store = openStore(root, flags);
+      const store = await openStore(root, flags);
       try {
         const kind =
           typeof flags.kind === 'string'
@@ -208,7 +214,7 @@ async function main(argv: string[]): Promise<number> {
     }
     case 'walk': {
       if (positional.length === 0) throw new Error('walk needs at least one node id or key');
-      const store = openStore(root, flags);
+      const store = await openStore(root, flags);
       try {
         const refs: NodeRef[] = positional.flatMap((ref) =>
           ref.includes(',') ? ref.split(',') : [ref],
@@ -235,7 +241,7 @@ async function main(argv: string[]): Promise<number> {
     case 'plan': {
       const raw = positional.join(' ').trim();
       if (!raw) throw new Error('plan needs a pipeline string or JSON plan');
-      const store = openStore(root, flags);
+      const store = await openStore(root, flags);
       try {
         const input = raw.startsWith('{') || raw.startsWith('[') ? JSON.parse(raw) : parsePlan(raw);
         const answer = executePlan(store, input);
@@ -258,7 +264,7 @@ async function main(argv: string[]): Promise<number> {
       }
     }
     case 'orphans': {
-      const store = openStore(root, flags);
+      const store = await openStore(root, flags);
       try {
         const result = findOrphans(store, {
           includeEntries: flags['include-entries'] === true,

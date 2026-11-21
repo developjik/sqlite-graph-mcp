@@ -49,11 +49,21 @@ npx -y @developjik/sqlite-graph-mcp plan 'find "walker" kind=symbol | walk type=
 | `defines` | file → symbol, file → heading, `package.json` → 그 패키지 |
 | `links_to` | 마크다운 링크/참조 → file 또는 heading, `#앵커` 포함 |
 | `depends_on` | file → package, 매니페스트의 package → 의존성 |
-| `references` | file → symbol: 그 파일이 이 심볼을 import함 (네임드, 디폴트, 네임스페이스, `export … from`, 디스트럭처링 `require`) |
+| `references` | file → symbol: 그 파일이 이 심볼을 **실제로 사용** (네임드/디폴트/네임스페이스/`require` 바인딩 기준, 미사용 import는 엣지 없음) |
 
 파일에는 태그가 붙고(`code`, `ts`, `doc`, `test`, `entry`, `manifest`, `exported`, …) 태그로
 필터할 수 있습니다 — `graph_orphans`가 별도 인자 없이 테스트·엔트리 파일을 건너뛰는 것도
 이 태그 덕분입니다.
+
+### 추출 엔진
+
+기본 **`ast` 엔진**은 tree-sitter WASM 문법(패키지에 동봉)으로 TypeScript/TSX(및 일반
+JS)를 실제 파싱합니다 — 네이티브 빌드도, 네트워크도 필요 없습니다. Import·심볼·export는
+파스 트리에서 나오고, `references` 엣지는 import한 바인딩을 **처음 실제 사용한 줄**에
+인용합니다. WASM 로드에 실패하면 색인은 **`heuristic` 엔진**(주석 마스킹 정규식,
+import 절 기반 references)으로 자동 폴백됩니다. 명시적으로 지정하려면
+`graph_index { engine: "heuristic" }` 또는 `--engine heuristic`; 색인 결과의
+`engine` 필드가 실제로 어떤 엔진이 돌았는지 알려줍니다.
 
 ## 설치
 
@@ -211,8 +221,8 @@ import한 파일 전부가 나옵니다:
   "count": 3,
   "nodes": [
     { "key": "symbol:src/graph/walker.ts#walkGraph", "depth": 0, "citation": "src/graph/walker.ts:7" },
-    { "key": "file:src/index.ts",                    "depth": 1, "citation": "src/index.ts:2" },
-    { "key": "file:src/graph/walker.test.ts",        "depth": 1, "citation": "src/graph/walker.test.ts:3" }
+    { "key": "file:src/index.ts",                    "depth": 1, "citation": "src/index.ts:9" },
+    { "key": "file:src/graph/walker.test.ts",        "depth": 1, "citation": "src/graph/walker.test.ts:6" }
   ]
 }
 ```
@@ -310,15 +320,12 @@ sqlite-graph-mcp serve --root . --db .sqlite-graph/index.db
 
 ## 아직 하지 않는 것
 
-휴리스틱 인덱서에 대한 정직함이 긴 기능 목록보다 중요합니다:
+한계에 대한 정직함이 긴 기능 목록보다 중요합니다:
 
-- **AST 없음.** Import, export, 선언은 TypeScript 파서가 아니라 주석 마스킹 정규식으로
-  추출합니다. 여러 줄 선언은 처리하고, 특이한 문법과 계산된 export 이름은 처리하지
-  않습니다.
-- **references는 import 절에서 나오고 호출 지점은 아님.** 네임드, 디폴트, 네임스페이스,
-  디스트럭처링 `require` import마다 `references` 엣지가 만들어집니다 ("이 심볼을 누가
-  쓰지?"는 실제로는 "누구의 import 절이 이 이름을 언급하지?"). 파일 안의 식별자 수준
-  사용 — 호출, 재할당, JSX — 은 추적하지 않고, 동적 `import()`는 파일만 연결합니다.
+- **스코프 완전 분석은 아님.** 기본 tree-sitter 엔진은 import한 바인딩과 그 식별자
+  사용을 추적하지만 스코프를 모델링하진 않습니다 — import한 이름을 가리는 지역
+  변수가 사용으로 세질 수 있고, JSX 식별자는 매칭하지 않습니다. 휴리스틱 폴백
+  엔진은 import 절만 봅니다 ("누가 import하지?"는 답해도 "누가 호출하지?"는 못 함).
 - **타입 해석은 부분적.** tsconfig/jsconfig `paths` + `baseUrl` (로컬 `extends` 체인)과
   워크스페이스 로컬 패키지(`main`/`module`/`index`)는 실제 파일로 해석합니다.
   package.json `exports` 필드, 번들러 설정 별칭(vite/webpack), `#` 접두사 패키지 내부
@@ -341,6 +348,7 @@ npm run build       # tsc → dist/
 
 ```
 bin/cli.ts        CLI 진입점 (shebang, 서브커맨드, JSON 출력)
+src/ast.ts        tree-sitter(WASM) 엔진: 파스 트리 기반 import/심볼, 바인딩 사용 추적
 src/db.ts         스키마, FTS5 인덱스, GraphStore (prepared statements)
 src/indexer.ts    워크스페이스 스캔, 주석 마스킹, 심볼/import/제목 추출, tsconfig paths, 워크스페이스 패키지
 src/query.ts      SQLite 위의 find / walk / filter / minus / orphans
@@ -350,10 +358,12 @@ test/             fixtures, 단위 테스트, stdio MCP 프로토콜 테스트
 ```
 
 테스트 스위트는 인덱서 개수와 멱등성, 확장자 리매핑 (`.js` import → `.ts` 소스),
-`references` 엣지 (네임드/디폴트/네임스페이스 import, 합성 디폴트 export), tsconfig
-`paths` 별칭과 워크스페이스 로컬 패키지 (`test/fixtures/mono` 참고), 스키마 버전
-마이그레이션, 사이클 안전 순회, 모든 연산자, 플랜 DSL, 고아 검출, CLI, 그리고 공식 SDK
-클라이언트와 줄바꿈 구분 JSON-RPC 양쪽으로의 MCP 핸드셰이크를 다룹니다.
+사용 기반 `references` (별칭/디폴트/네임스페이스 바인딩, 미사용 import는 엣지 없음,
+합성 디폴트 export), 두 엔진 전부, tsconfig `paths` 별칭과 워크스페이스 로컬 패키지
+(`test/fixtures/mono` 참고), 스키마 버전 마이그레이션, 사이클 안전 순회, 모든 연산자,
+플랜 DSL, 고아 검출, CLI, 그리고 공식 SDK 클라이언트와 줄바꿈 구분 JSON-RPC 양쪽으로의
+MCP 핸드셰이크를 다룹니다. `tree-sitter-wasms`를 올린 뒤에는 `npm run vendor:wasm`으로
+동봉 문법을 갱신하세요.
 
 ## 라이선스
 

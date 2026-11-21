@@ -47,10 +47,21 @@ it", the claim comes with a path and a line number.
 | `defines` | file → symbol, file → heading, `package.json` → its package |
 | `links_to` | Markdown link/reference → file or heading, including `#anchors` |
 | `depends_on` | file → package, package → dependency from the manifest |
-| `references` | file → symbol: the file imports that symbol (named, default, namespace, `export … from`, destructured `require`) |
+| `references` | file → symbol: the file actually uses that symbol (named/default/namespace/`require` bindings; unused imports produce no edge) |
 
 Files are tagged (`code`, `ts`, `doc`, `test`, `entry`, `manifest`, `exported`, …), and tags are
 filterable — that is how `graph_orphans` can skip test and entry files without extra arguments.
+
+### Extraction engines
+
+The default **`ast` engine** parses TypeScript/TSX (and plain JS) with
+tree-sitter WASM grammars vendored in the package — no native build, no
+network. Imports, symbols and exports come from the parse tree, and
+`references` edges cite the first line where an imported binding is actually
+used. If the WASM files cannot load, indexing falls back to the
+**`heuristic` engine** (comment-masked regexes, import-clause-based
+references). Force it explicitly with `graph_index { engine: "heuristic" }` or
+`--engine heuristic`; the index report says which engine ran (`engine: "ast"`).
 
 ## Install
 
@@ -199,7 +210,7 @@ SELECT id, MIN(depth) AS depth FROM walk GROUP BY id ORDER BY depth, id;
 
 Direction `in` finds dependents ("who breaks if I rename this?"), `both` finds the neighbourhood.
 `references` edges make the rename question concrete — walk them inbound from a symbol to list
-every file whose import uses it:
+every file that actually uses it (citations point at usage lines):
 
 ```jsonc
 // graph_walk { "start": ["symbol:src/graph/walker.ts#walkGraph"], "edgeType": "references", "direction": "in" }
@@ -207,8 +218,8 @@ every file whose import uses it:
   "count": 3,
   "nodes": [
     { "key": "symbol:src/graph/walker.ts#walkGraph", "depth": 0, "citation": "src/graph/walker.ts:7" },
-    { "key": "file:src/index.ts",                    "depth": 1, "citation": "src/index.ts:2" },
-    { "key": "file:src/graph/walker.test.ts",        "depth": 1, "citation": "src/graph/walker.test.ts:3" }
+    { "key": "file:src/index.ts",                    "depth": 1, "citation": "src/index.ts:9" },
+    { "key": "file:src/graph/walker.test.ts",        "depth": 1, "citation": "src/graph/walker.test.ts:6" }
   ]
 }
 ```
@@ -305,15 +316,13 @@ shell conditions.
 
 ## What it does not do (yet)
 
-Being honest about a heuristic indexer matters more than a longer feature list:
+Being honest about the limits matters more than a longer feature list:
 
-- **No AST.** Imports, exports and declarations are extracted with comment-masked regular
-  expressions, not a TypeScript parser. Multi-line declarations are handled; exotic syntax and
-  computed export names are not.
-- **References come from import clauses, not call sites.** A `references` edge is created for
-  every named, default, namespace or destructured-`require` import (so "who uses this symbol?"
-  is really "whose import clause names it?"). Identifier-level usage inside a file — calls,
-  reassignments, JSX — is not tracked, and a dynamic `import()` only links files.
+- **No full scope analysis.** The default tree-sitter engine tracks imported
+  bindings and their identifier usages, but it does not model scopes: a local
+  that shadows an imported name can still count as a usage, and JSX
+  identifiers are not matched. The heuristic fallback engine only sees import
+  clauses ("who imports this symbol?", never "who calls it?").
 - **Type resolution is partial.** tsconfig/jsconfig `paths` + `baseUrl` (local `extends` chains)
   and workspace-local packages (`main`/`module`/`index`) resolve to real files; the package.json
   `exports` field, bundler-config aliases (vite/webpack), `#`-prefixed package-internal imports
@@ -336,6 +345,7 @@ Layout:
 
 ```
 bin/cli.ts        CLI entry (shebang, subcommands, JSON output)
+src/ast.ts        tree-sitter (WASM) engine: parse-tree imports/symbols, binding usage
 src/db.ts         schema, FTS5 index, GraphStore (prepared statements)
 src/indexer.ts    workspace scan, comment masking, symbol/import/heading extraction, tsconfig paths, workspace packages
 src/query.ts      find / walk / filter / minus / orphans over SQLite
@@ -345,10 +355,12 @@ test/             fixtures, unit tests, stdio MCP protocol tests
 ```
 
 The test suite covers indexer counts and idempotency, extension remapping (`.js` import →
-`.ts` source), `references` edges (named/default/namespace imports, synthetic default exports),
-tsconfig `paths` aliases and workspace-local packages (see `test/fixtures/mono`), schema-version
-migration, cycle-safe traversal, every operator, the plan DSL, orphan detection, the CLI, and
-the MCP handshake both through the official SDK client and as raw newline-delimited JSON-RPC.
+`.ts` source), usage-based `references` (alias/default/namespace bindings, unused imports
+produce no edge, synthetic default exports), both engines, tsconfig `paths` aliases and
+workspace-local packages (see `test/fixtures/mono`), schema-version migration, cycle-safe
+traversal, every operator, the plan DSL, orphan detection, the CLI, and the MCP handshake
+both through the official SDK client and as raw newline-delimited JSON-RPC. Refresh the
+vendored grammars after bumping `tree-sitter-wasms` with `npm run vendor:wasm`.
 
 ## License
 

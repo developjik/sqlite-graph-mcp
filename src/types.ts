@@ -115,6 +115,12 @@ export interface IndexOptions {
   dbPath?: string;
   /** Extra directory/file names to skip, on top of the built-in list. */
   ignore?: string[];
+  /**
+   * Extraction engine: 'ast' uses tree-sitter (WASM) and grounds `references`
+   * in identifier usage; 'heuristic' uses comment-masked regexes. Defaults to
+   * 'ast', falling back to 'heuristic' when the WASM grammars fail to load.
+   */
+  engine?: 'ast' | 'heuristic';
   /** Hard cap on indexed files. Defaults to 5000. */
   maxFiles?: number;
   /** Skip files larger than this many bytes. Defaults to 512 KiB. */
@@ -128,6 +134,8 @@ export interface IndexStats {
   skippedFiles: number;
   nodes: Record<NodeKind, number> & { total: number };
   edges: Record<EdgeType, number> & { total: number };
+  /** Which extraction engine actually ran. */
+  engine: 'ast' | 'heuristic';
   durationMs: number;
   indexedAt: string;
 }

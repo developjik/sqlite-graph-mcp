@@ -13,8 +13,8 @@ afterEach(() => {
 });
 
 describe('indexWorkspace', () => {
-  it('builds the expected node and edge counts for the fixture workspace', () => {
-    const graph = createFixtureGraph();
+  it('builds the expected node and edge counts for the fixture workspace', async () => {
+    const graph = await createFixtureGraph();
     graphs.push(graph);
 
     expect(graph.stats.files).toBe(12);
@@ -27,8 +27,8 @@ describe('indexWorkspace', () => {
     expect(graph.stats.skippedFiles).toBe(0);
   });
 
-  it('records stable, self-describing node keys', () => {
-    const graph = createFixtureGraph();
+  it('records stable, self-describing node keys', async () => {
+    const graph = await createFixtureGraph();
     graphs.push(graph);
 
     const symbol = graph.store.nodeByKey('symbol:src/graph/walker.ts#walkGraph');
@@ -48,8 +48,8 @@ describe('indexWorkspace', () => {
     expect(pkg?.meta.version).toBe('1.0.0');
   });
 
-  it('resolves relative imports that use a .js extension to .ts sources', () => {
-    const graph = createFixtureGraph();
+  it('resolves relative imports that use a .js extension to .ts sources', async () => {
+    const graph = await createFixtureGraph();
     graphs.push(graph);
 
     const fromIndex = walkNodes(graph.store, idsOfKeys(graph.store, ['file:src/index.ts']), {
@@ -62,8 +62,8 @@ describe('indexWorkspace', () => {
     expect(fromIndex.depths.get(graph.store.nodeByKey('file:src/greet.ts')?.id as number)).toBe(1);
   });
 
-  it('links bare imports to package nodes from package.json', () => {
-    const graph = createFixtureGraph();
+  it('links bare imports to package nodes from package.json', async () => {
+    const graph = await createFixtureGraph();
     graphs.push(graph);
 
     const deps = graph.store.db
@@ -80,8 +80,8 @@ describe('indexWorkspace', () => {
     expect(pairs).toContain('file:src/graph/walker.test.ts->package:vitest');
   });
 
-  it('extracts markdown headings and resolves doc links, including anchors', () => {
-    const graph = createFixtureGraph();
+  it('extracts markdown headings and resolves doc links, including anchors', async () => {
+    const graph = await createFixtureGraph();
     graphs.push(graph);
 
     const links = graph.store.db
@@ -99,14 +99,14 @@ describe('indexWorkspace', () => {
     expect(targets).toContain('file:docs/guide.md->heading:docs/spec.md#goals');
   });
 
-  it('is idempotent: re-indexing keeps keys stable and does not duplicate rows', () => {
-    const graph = createFixtureGraph();
+  it('is idempotent: re-indexing keeps keys stable and does not duplicate rows', async () => {
+    const graph = await createFixtureGraph();
     graphs.push(graph);
     const before = {
       nodes: graph.store.countNodes(),
       edges: (graph.store.db.prepare('SELECT COUNT(*) AS c FROM edges').get() as { c: number }).c,
     };
-    const reindexed = indexWorkspace({ root: fixtureRoot, dbPath: graph.dbPath });
+    const reindexed = await indexWorkspace({ root: fixtureRoot, dbPath: graph.dbPath });
     expect(reindexed.nodes.total).toBe(graph.stats.nodes.total);
     expect(reindexed.edges.total).toBe(graph.stats.edges.total);
     expect(graph.store.countNodes()).toBe(before.nodes);
@@ -116,7 +116,7 @@ describe('indexWorkspace', () => {
     expect(graph.store.nodeByKey('symbol:src/graph/walker.ts#walkGraph')?.line).toBe(7);
   });
 
-  it('skips node_modules, dist and files above the size cap', () => {
+  it('skips node_modules, dist and files above the size cap', async () => {
     const dir = tempDir('skip');
     graphs.push({ cleanup: () => graphCleanup(dir) });
     mkdirSync(join(dir, 'node_modules', 'pkg'), { recursive: true });
@@ -132,13 +132,13 @@ describe('indexWorkspace', () => {
     expect(rels).toEqual(['src/a.ts']);
     expect(collected.skipped).toBe(1);
 
-    const stats = indexWorkspace({ root: dir, dbPath: join(dir, 'g.db'), maxFileBytes: 1024 });
+    const stats = await indexWorkspace({ root: dir, dbPath: join(dir, 'g.db'), maxFileBytes: 1024 });
     expect(stats.files).toBe(1);
     expect(stats.skippedFiles).toBe(1);
   });
 
-  it('records languages, tags and content used for citations', () => {
-    const graph = createFixtureGraph();
+  it('records languages, tags and content used for citations', async () => {
+    const graph = await createFixtureGraph();
     graphs.push(graph);
 
     const file = graph.store.nodeByKey('file:src/graph/walker.test.ts');
@@ -150,11 +150,11 @@ describe('indexWorkspace', () => {
 
     const found = findNodes(graph.store, 'greetEmoji', { kind: 'symbol' });
     expect(found.nodes[0]?.name).toBe('greetEmoji');
-    expect(found.nodes[0]?.content).toContain('export const greetEmoji');
+    expect(found.nodes[0]?.content).toContain('greetEmoji');
   });
 
-  it('adds references edges from named imports', () => {
-    const graph = createFixtureGraph();
+  it('adds references edges from named imports', async () => {
+    const graph = await createFixtureGraph();
     graphs.push(graph);
 
     const refs = graph.store.db
@@ -169,14 +169,33 @@ describe('indexWorkspace', () => {
     expect(pairs).toContain('file:src/index.ts->symbol:src/graph/walker.ts#walkGraph');
     expect(pairs).toContain('file:src/graph/walker.ts->symbol:src/graph/cycle-a.ts#cycleA');
     expect(pairs).toContain('file:src/graph/walker.test.ts->symbol:src/graph/walker.ts#walkGraph');
-    // The reference is cited at the import line, not the declaration.
-    expect(refs.find((r) => r.dst === 'symbol:src/greet.ts#greet')?.line).toBe(1);
+    // AST engine: the reference is cited at the first *usage* line
+    // (`greet(padded)` inside main), not the import or the declaration.
+    expect(refs.find((r) => r.dst === 'symbol:src/greet.ts#greet')?.line).toBe(10);
+  });
+
+  it('runs the tree-sitter engine by default and falls back on demand', async () => {
+    const graph = await createFixtureGraph();
+    graphs.push(graph);
+    expect(graph.stats.engine).toBe('ast');
+
+    const heuristic = await createFixtureGraph({ engine: 'heuristic' });
+    graphs.push(heuristic);
+    expect(heuristic.stats.engine).toBe('heuristic');
+    // Import-clause semantics: the citation is the import line again.
+    const refs = heuristic.store.db
+      .prepare(
+        `SELECT e.line FROM edges e JOIN nodes d ON d.id = e.dst
+         WHERE e.type = 'references' AND d.key = 'symbol:src/greet.ts#greet'`,
+      )
+      .all() as { line: number }[];
+    expect(refs[0]?.line).toBe(1);
   });
 });
 
 describe('mono workspace: aliases, workspace packages, default imports', () => {
-  it('resolves tsconfig paths aliases to workspace files', () => {
-    const graph = createFixtureGraph({ root: monoRoot });
+  it('resolves tsconfig paths aliases to workspace files', async () => {
+    const graph = await createFixtureGraph({ root: monoRoot });
     graphs.push(graph);
 
     const imports = graph.store.db
@@ -192,8 +211,8 @@ describe('mono workspace: aliases, workspace packages, default imports', () => {
     expect(targets).toContain('file:packages/local-lib/src/entry.ts'); // 'local-lib' entry
   });
 
-  it('links workspace-local packages and keeps externals external', () => {
-    const graph = createFixtureGraph({ root: monoRoot });
+  it('links workspace-local packages and keeps externals external', async () => {
+    const graph = await createFixtureGraph({ root: monoRoot });
     graphs.push(graph);
 
     const deps = graph.store.db
@@ -215,8 +234,8 @@ describe('mono workspace: aliases, workspace packages, default imports', () => {
     expect(graph.store.nodeByKey('package:undeclared-pkg')?.tags).toContain('external');
   });
 
-  it('references aliased symbols and synthetic default exports', () => {
-    const graph = createFixtureGraph({ root: monoRoot });
+  it('references aliased symbols and synthetic default exports', async () => {
+    const graph = await createFixtureGraph({ root: monoRoot });
     graphs.push(graph);
 
     const refs = graph.store.db
@@ -243,10 +262,44 @@ describe('mono workspace: aliases, workspace packages, default imports', () => {
       .get() as { c: number };
     expect(exported.c).toBe(1);
   });
+
+  it('omits references for unused imports and tracks namespace members', async () => {
+    const graph = await createFixtureGraph({ root: monoRoot });
+    graphs.push(graph);
+
+    // unused.ts imports greet but never uses it: no reference, only imports.
+    const unusedRefs = graph.store.db
+      .prepare(
+        `SELECT COUNT(*) AS c FROM edges e
+         JOIN nodes s ON s.id = e.src JOIN nodes d ON d.id = e.dst
+         WHERE e.type = 'references' AND s.key = 'file:src/unused.ts'`,
+      )
+      .get() as { c: number };
+    expect(unusedRefs.c).toBe(0);
+    const unusedImports = graph.store.db
+      .prepare(
+        `SELECT COUNT(*) AS c FROM edges e
+         JOIN nodes s ON s.id = e.src JOIN nodes d ON d.id = e.dst
+         WHERE e.type = 'imports' AND s.key = 'file:src/unused.ts'`,
+      )
+      .get() as { c: number };
+    expect(unusedImports.c).toBe(1);
+
+    // ns.ts reaches libHelper through a namespace member access, cited at
+    // the usage line.
+    const nsRefs = graph.store.db
+      .prepare(
+        `SELECT d.key AS dst, e.line FROM edges e
+         JOIN nodes s ON s.id = e.src JOIN nodes d ON d.id = e.dst
+         WHERE e.type = 'references' AND s.key = 'file:src/ns.ts'`,
+      )
+      .all() as { dst: string; line: number }[];
+    expect(nsRefs).toEqual([{ dst: 'symbol:packages/local-lib/src/entry.ts#libHelper', line: 3 }]);
+  });
 });
 
 describe('parsing helpers', () => {
-  it('masks comments but preserves strings and byte offsets', () => {
+  it('masks comments but preserves strings and byte offsets', async () => {
     const source = [
       "import { a } from './a.js';",
       "// import { b } from './b.js';",
@@ -263,7 +316,7 @@ describe('parsing helpers', () => {
     expect(masked).toContain('export const c = 1;');
   });
 
-  it('resolves extensionless and index imports', () => {
+  it('resolves extensionless and index imports', async () => {
     const known = new Set(['src/a.ts', 'src/dir/index.ts', 'src/b.tsx']);
     expect(resolveRelative('src/main.ts', './a', known)).toBe('src/a.ts');
     expect(resolveRelative('src/main.ts', './dir', known)).toBe('src/dir/index.ts');
@@ -271,7 +324,7 @@ describe('parsing helpers', () => {
     expect(resolveRelative('src/main.ts', '../outside/x', known)).toBeNull();
   });
 
-  it('slugifies headings to GitHub-style anchors', () => {
+  it('slugifies headings to GitHub-style anchors', async () => {
     expect(slugify('Graph Spec')).toBe('graph-spec');
     expect(slugify('Open Questions?')).toBe('open-questions');
     expect(slugify('Usage (advanced)')).toBe('usage-advanced');
