@@ -39,6 +39,13 @@ const VALUE_FLAGS = new Set([
 ]);
 
 export function parseArgs(argv: string[]): ParsedArgs {
+  // `--help` / `--version` are commands, not flags: without this they would be
+  // swallowed and the CLI would start the stdio server instead.
+  const first = argv[0];
+  if (first === '--help' || first === '-h' || first === '--version' || first === '-v') {
+    return { command: first, positional: argv.slice(1), flags: {} };
+  }
+
   const positional: string[] = [];
   const flags: Record<string, string | boolean> = {};
   for (let i = 0; i < argv.length; i += 1) {

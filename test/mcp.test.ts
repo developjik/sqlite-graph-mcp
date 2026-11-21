@@ -306,6 +306,23 @@ describe('CLI', () => {
     }
   });
 
+  it('prints version and help for the leading flags without starting the server', () => {
+    const version = execFileSync(process.execPath, [cliPath, '--version'], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      timeout: 10_000,
+    });
+    expect(version.trim()).toMatch(/^\d+\.\d+\.\d+$/);
+
+    const help = execFileSync(process.execPath, [cliPath, '--help'], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      timeout: 10_000,
+    });
+    expect(help).toContain('Operator 5');
+    expect(help).toContain('--root');
+  });
+
   it('exits 1 when a search finds nothing', () => {
     const dir = tempDir('cli-empty');
     try {
