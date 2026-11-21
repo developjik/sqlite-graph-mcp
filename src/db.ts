@@ -56,7 +56,7 @@ CREATE TABLE IF NOT EXISTS edges (
   id   INTEGER PRIMARY KEY AUTOINCREMENT,
   src  INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
   dst  INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
-  type TEXT NOT NULL CHECK (type IN ('imports','exports','defines','links_to','depends_on')),
+  type TEXT NOT NULL CHECK (type IN ('imports','exports','defines','links_to','depends_on','references')),
   line INTEGER,
   meta TEXT NOT NULL DEFAULT '{}',
   UNIQUE (src, dst, type)
@@ -94,7 +94,7 @@ CREATE TRIGGER IF NOT EXISTS nodes_fts_au AFTER UPDATE ON nodes BEGIN
 END;
 `;
 
-const SCHEMA_VERSION = '1';
+export const SCHEMA_VERSION = '2';
 
 export class GraphStore {
   readonly db: Database.Database;
@@ -110,6 +110,16 @@ export class GraphStore {
     this.db.pragma('foreign_keys = ON');
     this.db.pragma('synchronous = NORMAL');
     this.db.exec(SCHEMA);
+    const existingVersion = this.getMeta('schema_version');
+    if (existingVersion !== null && existingVersion !== SCHEMA_VERSION) {
+      // Incompatible schema (e.g. an edge CHECK without `references`): rebuild
+      // from scratch. The graph is derived data; the next index run refills it.
+      this.db.exec(
+        'DROP TABLE IF EXISTS nodes_fts; DROP TABLE IF EXISTS edges; ' +
+          'DROP TABLE IF EXISTS nodes; DROP TABLE IF EXISTS graph_meta;',
+      );
+      this.db.exec(SCHEMA);
+    }
     this.setMetaIfEmpty('schema_version', SCHEMA_VERSION);
   }
 

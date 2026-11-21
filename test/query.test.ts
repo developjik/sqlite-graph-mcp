@@ -109,6 +109,19 @@ describe('walk (operator 2)', () => {
     const { store } = setup();
     expect(walkNodes(store, ['file:does/not/exist.ts']).nodes).toEqual([]);
   });
+
+  it('walks inbound references to list the files that use a symbol', () => {
+    const { store } = setup();
+    const walked = walkNodes(store, idsOfKeys(store, ['symbol:src/graph/walker.ts#walkGraph']), {
+      edgeType: 'references',
+      direction: 'in',
+      maxDepth: 1,
+    });
+    const keys = keySet(walked.nodes);
+    expect(keys.has('file:src/index.ts')).toBe(true);
+    expect(keys.has('file:src/graph/walker.test.ts')).toBe(true);
+    expect(walked.nodes.every((n) => n.kind === 'file' || n.kind === 'symbol')).toBe(true);
+  });
 });
 
 describe('filter (operator 3)', () => {

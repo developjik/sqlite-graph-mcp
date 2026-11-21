@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { collectFiles, indexWorkspace, maskComments, resolveRelative, slugify } from '../src/indexer.js';
 import { findNodes, walkNodes } from '../src/query.js';
-import { createFixtureGraph, fixtureRoot, idsOfKeys, keySet, tempDir } from './helpers.js';
+import { createFixtureGraph, fixtureRoot, idsOfKeys, keySet, monoRoot, tempDir } from './helpers.js';
 
 const graphs: { cleanup: () => void }[] = [];
 afterEach(() => {
@@ -22,7 +22,7 @@ describe('indexWorkspace', () => {
     expect(graph.stats.nodes.heading).toBe(9);
     expect(graph.stats.nodes.package).toBe(3);
     expect(graph.stats.nodes.symbol).toBe(12);
-    expect(graph.stats.edges.imports).toBe(6);
+    expect(graph.stats.edges.references).toBe(6);
     expect(graph.stats.edges.links_to).toBeGreaterThanOrEqual(8);
     expect(graph.stats.skippedFiles).toBe(0);
   });
@@ -151,6 +151,97 @@ describe('indexWorkspace', () => {
     const found = findNodes(graph.store, 'greetEmoji', { kind: 'symbol' });
     expect(found.nodes[0]?.name).toBe('greetEmoji');
     expect(found.nodes[0]?.content).toContain('export const greetEmoji');
+  });
+
+  it('adds references edges from named imports', () => {
+    const graph = createFixtureGraph();
+    graphs.push(graph);
+
+    const refs = graph.store.db
+      .prepare(
+        `SELECT s.key AS src, d.key AS dst, e.line FROM edges e
+         JOIN nodes s ON s.id = e.src JOIN nodes d ON d.id = e.dst
+         WHERE e.type = 'references' ORDER BY s.key, d.key`,
+      )
+      .all() as { src: string; dst: string; line: number }[];
+    const pairs = refs.map((row) => `${row.src}->${row.dst}`);
+    expect(pairs).toContain('file:src/index.ts->symbol:src/greet.ts#greet');
+    expect(pairs).toContain('file:src/index.ts->symbol:src/graph/walker.ts#walkGraph');
+    expect(pairs).toContain('file:src/graph/walker.ts->symbol:src/graph/cycle-a.ts#cycleA');
+    expect(pairs).toContain('file:src/graph/walker.test.ts->symbol:src/graph/walker.ts#walkGraph');
+    // The reference is cited at the import line, not the declaration.
+    expect(refs.find((r) => r.dst === 'symbol:src/greet.ts#greet')?.line).toBe(1);
+  });
+});
+
+describe('mono workspace: aliases, workspace packages, default imports', () => {
+  it('resolves tsconfig paths aliases to workspace files', () => {
+    const graph = createFixtureGraph({ root: monoRoot });
+    graphs.push(graph);
+
+    const imports = graph.store.db
+      .prepare(
+        `SELECT s.key AS src, d.key AS dst FROM edges e
+         JOIN nodes s ON s.id = e.src JOIN nodes d ON d.id = e.dst
+         WHERE e.type = 'imports' AND s.key = 'file:src/app.ts'`,
+      )
+      .all() as { src: string; dst: string }[];
+    const targets = imports.map((row) => row.dst);
+    expect(targets).toContain('file:src/greet.ts'); // '@/greet'
+    expect(targets).toContain('file:shared/index.ts'); // '@shared'
+    expect(targets).toContain('file:packages/local-lib/src/entry.ts'); // 'local-lib' entry
+  });
+
+  it('links workspace-local packages and keeps externals external', () => {
+    const graph = createFixtureGraph({ root: monoRoot });
+    graphs.push(graph);
+
+    const deps = graph.store.db
+      .prepare(
+        `SELECT s.key AS src, d.key AS dst FROM edges e
+         JOIN nodes s ON s.id = e.src JOIN nodes d ON d.id = e.dst
+         WHERE e.type = 'depends_on'`,
+      )
+      .all() as { src: string; dst: string }[];
+    const pairs = deps.map((row) => `${row.src}->${row.dst}`);
+    expect(pairs).toContain('package:mono-root->package:local-lib');
+    expect(pairs).toContain('file:src/app.ts->package:local-lib');
+    expect(pairs).toContain('file:src/app.ts->package:some-external');
+
+    const localLib = graph.store.nodeByKey('package:local-lib');
+    expect(localLib?.tags).not.toContain('external');
+    // Declared in a manifest → dependency; only undeclared bare imports are 'external'.
+    expect(graph.store.nodeByKey('package:some-external')?.tags).toContain('dependency');
+    expect(graph.store.nodeByKey('package:undeclared-pkg')?.tags).toContain('external');
+  });
+
+  it('references aliased symbols and synthetic default exports', () => {
+    const graph = createFixtureGraph({ root: monoRoot });
+    graphs.push(graph);
+
+    const refs = graph.store.db
+      .prepare(
+        `SELECT s.key AS src, d.key AS dst FROM edges e
+         JOIN nodes s ON s.id = e.src JOIN nodes d ON d.id = e.dst
+         WHERE e.type = 'references' AND s.key = 'file:src/app.ts'`,
+      )
+      .all() as { src: string; dst: string }[];
+    const targets = refs.map((row) => row.dst);
+    // `import { greet as sayHello }` references the exported name.
+    expect(targets).toContain('symbol:src/greet.ts#greet');
+    expect(targets).toContain('symbol:shared/index.ts#SHARED');
+    // `import libEntry from 'local-lib'` → synthetic #default, defined and
+    // exported by the entry file, so it is not an orphan.
+    const synthetic = graph.store.nodeByKey('symbol:packages/local-lib/src/entry.ts#default');
+    expect(synthetic?.tags).toContain('synthetic');
+    expect(targets).toContain('symbol:packages/local-lib/src/entry.ts#default');
+    const exported = graph.store.db
+      .prepare(
+        `SELECT COUNT(*) AS c FROM edges e JOIN nodes n ON n.id = e.dst
+         WHERE e.type = 'exports' AND n.key = 'symbol:packages/local-lib/src/entry.ts#default'`,
+      )
+      .get() as { c: number };
+    expect(exported.c).toBe(1);
   });
 });
 

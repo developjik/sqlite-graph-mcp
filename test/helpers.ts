@@ -8,6 +8,7 @@ import type { GraphNode, IndexStats } from '../src/types.js';
 
 export const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 export const fixtureRoot = join(repoRoot, 'test', 'fixtures', 'ws');
+export const monoRoot = join(repoRoot, 'test', 'fixtures', 'mono');
 export const cliPath = join(repoRoot, 'dist', 'bin', 'cli.js');
 
 export interface FixtureGraph {
@@ -25,10 +26,10 @@ export function tempDir(prefix = 'sqlite-graph'): string {
 }
 
 /** Index the fixture workspace into a throwaway database. */
-export function createFixtureGraph(options: { dbPath?: string } = {}): FixtureGraph {
+export function createFixtureGraph(options: { dbPath?: string; root?: string } = {}): FixtureGraph {
   const dir = options.dbPath ? dirname(options.dbPath) : tempDir();
   const dbPath = options.dbPath ?? join(dir, 'index.db');
-  const stats = indexWorkspace({ root: fixtureRoot, dbPath });
+  const stats = indexWorkspace({ root: options.root ?? fixtureRoot, dbPath });
   const store = new GraphStore(dbPath);
   return {
     dir,
