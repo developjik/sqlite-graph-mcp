@@ -9,8 +9,9 @@
  *   sqlite-graph-mcp plan <plan>     chained find|walk|filter|minus answer
  *   sqlite-graph-mcp orphans         unreferenced files / unexported symbols
  */
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { GraphStore, defaultDbPath } from '../src/db.js';
 import { indexWorkspace } from '../src/indexer.js';
@@ -291,9 +292,24 @@ process.stdout.on('error', (error: NodeJS.ErrnoException) => {
   throw error;
 });
 
-const invokedDirectly =
-  process.argv[1] !== undefined &&
-  /(?:^|[\\/])cli\.(?:js|ts)$/.test(process.argv[1]);
+/**
+ * True when this file is the process entry point.
+ *
+ * `realpathSync` matters: npx and global installs run the package through a
+ * `.bin` symlink named `sqlite-graph-mcp`, so argv[1] is that symlink and never
+ * ends in `cli.js`.
+ */
+function isEntryPoint(): boolean {
+  const arg = process.argv[1];
+  if (!arg) return false;
+  try {
+    return realpathSync(arg) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return /(?:^|[\\/])cli\.(?:js|ts)$/.test(arg);
+  }
+}
+
+const invokedDirectly = isEntryPoint();
 
 if (invokedDirectly) {
   main(process.argv.slice(2))

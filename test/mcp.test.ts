@@ -1,5 +1,5 @@
 import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { existsSync, rmSync } from 'node:fs';
+import { existsSync, rmSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -301,6 +301,22 @@ describe('CLI', () => {
         encoding: 'utf8',
       });
       expect(help).toContain('Operator 1');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('runs when invoked through a symlink, as npx and npm bins do', () => {
+    const dir = tempDir('bin-link');
+    try {
+      const link = join(dir, 'sqlite-graph-mcp');
+      symlinkSync(cliPath, link);
+      const out = execFileSync(process.execPath, [link, '--version'], {
+        cwd: repoRoot,
+        encoding: 'utf8',
+        timeout: 10_000,
+      });
+      expect(out.trim()).toMatch(/^\d+\.\d+\.\d+$/);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
