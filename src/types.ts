@@ -8,7 +8,7 @@
 export const NODE_KINDS = ['file', 'symbol', 'heading', 'package'] as const;
 export type NodeKind = (typeof NODE_KINDS)[number];
 
-export const EDGE_TYPES = ['imports', 'exports', 'defines', 'links_to', 'depends_on'] as const;
+export const EDGE_TYPES = ['imports', 'exports', 'defines', 'links_to', 'depends_on', 'references'] as const;
 export type EdgeType = (typeof EDGE_TYPES)[number];
 
 export type WalkDirection = 'out' | 'in' | 'both';

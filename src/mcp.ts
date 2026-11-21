@@ -12,7 +12,7 @@ import { filterNodes, findNodes, findOrphans, toEdgeViews, toNodeView, walkNodes
 import { EDGE_TYPES, NODE_KINDS, type IndexStats } from './types.js';
 
 export const SERVER_NAME = 'sqlite-graph-mcp';
-export const SERVER_VERSION = '0.1.0';
+export const SERVER_VERSION = '0.2.0';
 
 export interface GraphServerOptions {
   /** Workspace root to index. Defaults to `process.cwd()`. */
@@ -110,9 +110,10 @@ export function createGraphServer(options: GraphServerOptions = {}): GraphServer
     {
       instructions:
         'Local code & spec graph over SQLite. Index a workspace once with graph_index, then answer ' +
-        'structural questions with graph_find (text search), graph_walk (follow imports/defines/links), ' +
+        'structural questions with graph_find (text search), graph_walk (follow imports/defines/references/links), ' +
         'graph_plan (chain find → walk → filter → minus and get path:line citations), and graph_orphans ' +
-        '(unreferenced files, unexported symbols). No embeddings: every result is backed by a file and line.',
+        '(unreferenced files, unexported symbols). No embeddings: every result is backed by a file and line. ' +
+        'tsconfig paths aliases and workspace-local packages resolve to real files.',
     },
   );
 
@@ -123,7 +124,8 @@ export function createGraphServer(options: GraphServerOptions = {}): GraphServer
       description:
         'Scan the workspace for .ts/.tsx/.js/.jsx/.md files and package.json manifests, and build the ' +
         'SQLite graph at .sqlite-graph/index.db (nodes: file, symbol, heading, package; edges: imports, ' +
-        'exports, defines, links_to, depends_on). Safe to re-run: it rebuilds atomically.',
+        'exports, defines, links_to, depends_on, references). tsconfig paths aliases and workspace-local ' +
+        'packages resolve to real files. Safe to re-run: it rebuilds atomically.',
       inputSchema: {
         root: z.string().optional().describe('Workspace directory to index (defaults to the server root).'),
         force: z.boolean().optional().describe('Accepted for symmetry; indexing always rebuilds.'),
@@ -182,8 +184,9 @@ export function createGraphServer(options: GraphServerOptions = {}): GraphServer
       title: 'Walk the graph',
       description:
         'Operator 2 (walk): traverse edges from a set of nodes with a recursive CTE (cycle-safe, depth ' +
-        'capped). Direction out = dependencies/definitions, in = dependents/references. Each node returns ' +
-        'its traversal depth and a path:line citation.',
+        'capped). Direction out = dependencies/definitions, in = dependents/references — e.g. walk ' +
+        'type=references dir=in from a symbol lists the files that import it. Each node returns its ' +
+        'traversal depth and a path:line citation.',
       inputSchema: {
         start: z
           .array(z.union([z.number(), z.string()]))

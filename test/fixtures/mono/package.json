@@ -1,0 +1,10 @@
+{
+  "name": "mono-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": {
+    "local-lib": "*",
+    "some-external": "^1.0.0"
+  }
+}

@@ -136,16 +136,16 @@ async function main(argv: string[]): Promise<number> {
           '  --db <path>           Database file (default: <root>/.sqlite-graph/index.db)',
           '  --kind <kind>         file|symbol|heading|package (comma separated)',
           '  --limit <n>           Result cap',
-          '  --type <edge>         imports|exports|defines|links_to|depends_on',
+          '  --type <edge>         imports|exports|defines|links_to|depends_on|references',
           '  --dir out|in|both     Walk direction (default: out)',
           '  --depth <n>           Walk depth (default: 6)',
           '  --json                Machine-readable output',
           '',
           'Examples:',
-          '  npx sqlite-graph-mcp index',
-          '  npx sqlite-graph-mcp find "walkNodes" --kind symbol',
-          '  npx sqlite-graph-mcp walk 42 --type imports --depth 3',
-          '  npx sqlite-graph-mcp plan \'find "graph" kind=symbol | walk type=imports dir=in depth=2\'',
+          '  npx @developjik/sqlite-graph-mcp index',
+          '  npx @developjik/sqlite-graph-mcp find "walkNodes" --kind symbol',
+          '  npx @developjik/sqlite-graph-mcp walk 42 --type imports --depth 3',
+          '  npx @developjik/sqlite-graph-mcp plan \'find "graph" kind=symbol | walk type=references dir=in\'',
           '',
         ].join('\n'),
       );
@@ -182,7 +182,7 @@ async function main(argv: string[]): Promise<number> {
         process.stdout.write(
           `Indexed ${stats.files} files in ${stats.durationMs}ms → ${stats.dbPath}\n` +
             `  nodes: ${nodes.total} (file ${nodes.file}, symbol ${nodes.symbol}, heading ${nodes.heading}, package ${nodes.package})\n` +
-            `  edges: ${edges.total} (imports ${edges.imports}, exports ${edges.exports}, defines ${edges.defines}, links_to ${edges.links_to}, depends_on ${edges.depends_on})\n`,
+            `  edges: ${edges.total} (imports ${edges.imports}, exports ${edges.exports}, defines ${edges.defines}, links_to ${edges.links_to}, depends_on ${edges.depends_on}, references ${edges.references})\n`,
         );
       }
       return 0;

@@ -1,6 +1,6 @@
 {
-  "name": "sqlite-graph-mcp",
-  "version": "0.1.0",
+  "name": "@developjik/sqlite-graph-mcp",
+  "version": "0.2.0",
   "description": "Zero-embedding code & spec graph MCP server: indexes a workspace into SQLite and answers 5-operator graph queries (find, walk, filter, minus, answer) over recursive CTEs.",
   "author": "Inkwon Jung (https://github.com/developjik)",
   "repository": {
@@ -13,6 +13,9 @@
   },
   "license": "MIT",
   "type": "module",
+  "publishConfig": {
+    "access": "public"
+  },
   "engines": {
     "node": ">=20.0.0"
   },

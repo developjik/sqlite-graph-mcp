@@ -1,8 +1,8 @@
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
-import { join, relative, resolve, sep } from 'node:path';
+import { dirname, join, relative, resolve, sep } from 'node:path';
 import * as posix from 'node:path/posix';
 
-import { GraphStore, defaultDbPath } from './db.js';
+import { GraphStore, SCHEMA_VERSION, defaultDbPath } from './db.js';
 import type { EdgeType, IndexOptions, IndexStats, NodeKind } from './types.js';
 import {
   buildTerms,
@@ -106,6 +106,15 @@ interface ParsedEdge {
   line: number | null;
 }
 
+export interface ImportedNames {
+  /** `import X from …` / `const X = require(…)`. */
+  defaultImport: boolean;
+  /** `import * as NS from …` / `export * from …`: references every export. */
+  namespace: boolean;
+  /** Exported names from `{ a, b as c }` (the name before `as`). */
+  names: string[];
+}
+
 interface PendingLink {
   fromKey: string;
   fromPath: string;
@@ -113,11 +122,17 @@ interface PendingLink {
   line: number;
   /** `imports` for module specifiers, `links_to` for markdown links. */
   edge: 'imports' | 'links_to';
+  /** Symbols the importing statement uses, when the clause was parsed. */
+  imports?: ImportedNames;
+  /** Already resolved workspace-relative target (alias / workspace package). */
+  resolved?: string;
 }
 
 interface PackageInfo {
   name: string;
   version?: string;
+  /** `main`/`module` field, relative to the manifest. */
+  entry?: string;
   external: boolean;
   dev: boolean;
   manifests: Set<string>;
@@ -143,11 +158,14 @@ export function indexWorkspace(options: IndexOptions): IndexStats {
   const dbPath = options.dbPath ? resolve(options.dbPath) : defaultDbPath(root);
   const collected = collectFiles(root, options);
   const relPaths = new Set(collected.files.map((f) => f.rel));
+  const aliasMap = loadAliasMap(root);
 
   const nodes = new Map<string, ParsedNode>();
   const edges: ParsedEdge[] = [];
   const pendingLinks: PendingLink[] = [];
   const packages = new Map<string, PackageInfo>();
+  /** First `export default` line per file, for default-import references. */
+  const defaultExports = new Map<string, { line: number; text: string }>();
 
   const addNode = (node: ParsedNode): void => {
     const existing = nodes.get(node.key);
@@ -170,28 +188,49 @@ export function indexWorkspace(options: IndexOptions): IndexStats {
       packages.set(name, info);
     }
     if (patch.version) info.version = patch.version;
+    if (patch.entry) info.entry = patch.entry;
     if (patch.external === false) info.external = false;
     if (patch.dev) info.dev = true;
     for (const m of patch.manifests ?? []) info.manifests.add(m);
     return info;
   };
 
+  const ctx: IndexContext = {
+    relPaths,
+    aliasMap,
+    packages,
+    pendingLinks,
+    defaultExports,
+    addNode,
+    addEdge,
+    upsertPackage,
+  };
+
+  // Pass 1: manifests first, so workspace-local packages are known before any
+  // code import is resolved.
   for (const file of collected.files) {
+    if (posix.basename(file.rel) !== 'package.json') continue;
     const source = readFileSafe(file.abs);
     if (source === null) {
       collected.skipped += 1;
       continue;
     }
-    const base = posix.basename(file.rel);
-    if (base === 'package.json') {
-      indexManifest(file.rel, source, addNode, addEdge, upsertPackage);
+    indexManifest(file.rel, source, ctx);
+  }
+
+  // Pass 2: code and docs.
+  for (const file of collected.files) {
+    if (posix.basename(file.rel) === 'package.json') continue;
+    const source = readFileSafe(file.abs);
+    if (source === null) {
+      collected.skipped += 1;
       continue;
     }
     const ext = posix.extname(file.rel).toLowerCase();
     if (CODE_EXTENSIONS.has(ext)) {
-      indexCodeFile(file.rel, source, addNode, addEdge, pendingLinks, upsertPackage);
+      indexCodeFile(file.rel, source, ctx);
     } else if (DOC_EXTENSIONS.has(ext)) {
-      indexDocFile(file.rel, source, addNode, addEdge, pendingLinks);
+      indexDocFile(file.rel, source, ctx);
     }
   }
 
@@ -214,12 +253,33 @@ export function indexWorkspace(options: IndexOptions): IndexStats {
     });
   }
 
-  // Resolve markdown links against the file/heading index.
+  // Resolve markdown links and import specifiers, and build `references`
+  // edges (importer file → exported symbol) for every parsed import clause.
   const headingKeys = new Set(
     [...nodes.values()].filter((n) => n.kind === 'heading').map((n) => n.key),
   );
+  const exportedByFile = new Map<string, ParsedNode[]>();
+  const symbolByLine = new Map<string, ParsedNode>();
+  for (const node of nodes.values()) {
+    if (node.kind !== 'symbol' || !node.path) continue;
+    symbolByLine.set(`${node.path}:${node.line}`, node);
+    if (node.meta.exported === true) {
+      const list = exportedByFile.get(node.path);
+      if (list) list.push(node);
+      else exportedByFile.set(node.path, [node]);
+    }
+  }
+  const refs: ReferenceContext = {
+    relPaths,
+    nodes,
+    exportedByFile,
+    symbolByLine,
+    defaultExports,
+    addNode,
+    addEdge,
+  };
   for (const link of pendingLinks) {
-    resolveLink(link, relPaths, headingKeys, addEdge);
+    resolveLink(link, headingKeys, refs);
   }
 
   const store = new GraphStore(dbPath);
@@ -249,7 +309,7 @@ export function indexWorkspace(options: IndexOptions): IndexStats {
       }
       store.setMeta('root', root);
       store.setMeta('indexed_at', new Date().toISOString());
-      store.setMeta('schema_version', '1');
+      store.setMeta('schema_version', SCHEMA_VERSION);
       store.setMeta('file_count', String(collected.files.length));
     });
 
@@ -272,6 +332,7 @@ export function indexWorkspace(options: IndexOptions): IndexStats {
         defines: counts['edge:defines'] ?? 0,
         links_to: counts['edge:links_to'] ?? 0,
         depends_on: counts['edge:depends_on'] ?? 0,
+        references: counts['edge:references'] ?? 0,
         total: counts['edge:total'] ?? 0,
       },
       durationMs: Date.now() - started,
@@ -350,16 +411,31 @@ export function collectFiles(root: string, options: IndexOptions): CollectedFile
   return { files, skipped };
 }
 
-type AddNode = (node: ParsedNode) => void;
-type AddEdge = (src: string, dst: string, type: EdgeType, line: number | null) => void;
+/** Shared context for the per-file indexing passes. */
+export interface IndexContext {
+  relPaths: Set<string>;
+  aliasMap: AliasMap | null;
+  packages: Map<string, PackageInfo>;
+  pendingLinks: PendingLink[];
+  defaultExports: Map<string, { line: number; text: string }>;
+  addNode: (node: ParsedNode) => void;
+  addEdge: (src: string, dst: string, type: EdgeType, line: number | null) => void;
+  upsertPackage: (name: string, patch: Partial<PackageInfo> & { dev?: boolean }) => PackageInfo;
+}
 
-function indexManifest(
-  rel: string,
-  source: string,
-  addNode: AddNode,
-  addEdge: AddEdge,
-  upsertPackage: (name: string, patch: Partial<PackageInfo>) => PackageInfo,
-): void {
+/** Everything `resolveLink` needs to add `references` edges. */
+interface ReferenceContext {
+  relPaths: Set<string>;
+  nodes: Map<string, ParsedNode>;
+  exportedByFile: Map<string, ParsedNode[]>;
+  symbolByLine: Map<string, ParsedNode>;
+  defaultExports: Map<string, { line: number; text: string }>;
+  addNode: (node: ParsedNode) => void;
+  addEdge: (src: string, dst: string, type: EdgeType, line: number | null) => void;
+}
+
+function indexManifest(rel: string, source: string, ctx: IndexContext): void {
+  const { addNode, addEdge, upsertPackage } = ctx;
   const fileKey = `file:${rel}`;
   addNode({
     key: fileKey,
@@ -382,6 +458,12 @@ function indexManifest(
   const selfName = typeof manifest.name === 'string' && manifest.name ? manifest.name : rel;
   const self = upsertPackage(selfName, {
     version: typeof manifest.version === 'string' ? manifest.version : undefined,
+    entry:
+      typeof manifest.main === 'string' && manifest.main
+        ? manifest.main
+        : typeof manifest.module === 'string' && manifest.module
+          ? manifest.module
+          : undefined,
     external: false,
     manifests: new Set([rel]),
   });
@@ -404,14 +486,8 @@ function indexManifest(
   }
 }
 
-function indexCodeFile(
-  rel: string,
-  source: string,
-  addNode: AddNode,
-  addEdge: AddEdge,
-  pendingLinks: PendingLink[],
-  upsertPackage: (name: string, patch: Partial<PackageInfo>) => PackageInfo,
-): void {
+function indexCodeFile(rel: string, source: string, ctx: IndexContext): void {
+  const { addNode, addEdge, upsertPackage, pendingLinks, aliasMap, relPaths, packages, defaultExports } = ctx;
   const fileKey = `file:${rel}`;
   const ext = posix.extname(rel).toLowerCase();
   const tags = ['code', ext.replace('.', '')];
@@ -433,19 +509,26 @@ function indexCodeFile(
 
   const masked = maskComments(source);
   const lineStarts = computeLineStarts(masked);
+  const lines = masked.split('\n');
 
   // ---- imports / re-exports / requires ----
-  const importPatterns: RegExp[] = [
-    /(?:^|[^\w$])(?:import|export)\s+(?:type\s+)?(?:[^;'"]*?\sfrom\s*)?['"]([^'"\n]+)['"]/g,
-    /(?:^|[^\w$.])require\s*\(\s*['"]([^'"\n]+)['"]\s*\)/g,
-    /(?:^|[^\w$.])import\s*\(\s*['"]([^'"\n]+)['"]\s*\)/g,
+  // Pattern 1 captures the import clause (everything before `from`) so
+  // `references` edges can name the symbols the importer uses.
+  const importPatterns: { re: RegExp; clauseGroup: number; specGroup: number }[] = [
+    {
+      re: /(?:^|[^\w$])(?:import|export)\s+(?:type\s+)?((?:[^;'"]*?)\s+from\s*)?['"]([^'"\n]+)['"]/g,
+      clauseGroup: 1,
+      specGroup: 2,
+    },
+    { re: /(?:^|[^\w$.])require\s*\(\s*['"]([^'"\n]+)['"]\s*\)/g, clauseGroup: 0, specGroup: 1 },
+    { re: /(?:^|[^\w$.])import\s*\(\s*['"]([^'"\n]+)['"]\s*\)/g, clauseGroup: 0, specGroup: 1 },
   ];
   const seenSpecs = new Set<string>();
-  for (const pattern of importPatterns) {
+  for (const { re: pattern, clauseGroup, specGroup } of importPatterns) {
     pattern.lastIndex = 0;
     let match: RegExpExecArray | null;
     while ((match = pattern.exec(masked)) !== null) {
-      const spec = match[1];
+      const spec = match[specGroup];
       if (!spec) continue;
       const quoteIndex = masked.indexOf(spec, match.index);
       const line = lineAtIndex(lineStarts, quoteIndex >= 0 ? quoteIndex : match.index);
@@ -453,13 +536,71 @@ function indexCodeFile(
       if (seenSpecs.has(key)) continue;
       seenSpecs.add(key);
 
+      const imports = parseImportedNames(
+        clauseGroup > 0 ? (match[clauseGroup] ?? null) : null,
+        clauseGroup === 0 ? (lines[line - 1] ?? null) : null,
+      );
+
       if (spec.startsWith('.') || spec.startsWith('/')) {
-        pendingLinks.push({ fromKey: fileKey, fromPath: rel, target: spec, line, edge: 'imports' });
-      } else {
-        const pkg = packageNameOf(spec);
-        if (!pkg || isBuiltin(spec)) continue;
-        upsertPackage(pkg, { external: true });
+        pendingLinks.push({ fromKey: fileKey, fromPath: rel, target: spec, line, edge: 'imports', imports });
+        continue;
+      }
+
+      // tsconfig `paths` alias → a workspace file, not a package.
+      const aliased = aliasMap ? resolveAlias(aliasMap, spec, relPaths) : null;
+      if (aliased) {
+        pendingLinks.push({
+          fromKey: fileKey,
+          fromPath: rel,
+          target: spec,
+          line,
+          edge: 'imports',
+          imports,
+          resolved: aliased,
+        });
+        continue;
+      }
+
+      const pkg = packageNameOf(spec);
+      if (!pkg || isBuiltin(spec)) continue;
+      const info = packages.get(pkg);
+      if (info && info.manifests.size > 0) {
+        // Workspace-local package: link the package node and, when the entry
+        // or subpath resolves to an indexed file, an imports edge too.
         addEdge(fileKey, `package:${pkg}`, 'depends_on', line);
+        const pkgDir = posix.dirname([...info.manifests][0] ?? rel);
+        const sub = spec.slice(pkg.length).replace(/^[\/\\]+/, '');
+        const bases = sub ? [`${pkgDir}/${sub}`] : [info.entry ? `${pkgDir}/${info.entry}` : null, `${pkgDir}/index`];
+        for (const b of bases) {
+          if (!b) continue;
+          const target = resolveFromRoot(b, relPaths);
+          if (target) {
+            pendingLinks.push({
+              fromKey: fileKey,
+              fromPath: rel,
+              target: spec,
+              line,
+              edge: 'imports',
+              imports,
+              resolved: target,
+            });
+            break;
+          }
+        }
+        continue;
+      }
+      upsertPackage(pkg, { external: true });
+      addEdge(fileKey, `package:${pkg}`, 'depends_on', line);
+    }
+  }
+
+  // ---- first `export default` line, for default-import references ----
+  if (!defaultExports.has(rel)) {
+    for (let i = 0; i < lines.length; i += 1) {
+      const text = lines[i] ?? '';
+      if (/^\s*export\s+default\b/.test(text)) {
+        defaultExports.set(rel, { line: i + 1, text: text.trim() });
+        break;
       }
     }
   }
@@ -485,7 +626,7 @@ function indexCodeFile(
     { kind: 'enum', re: /^\s*(?:export\s+)?(?:declare\s+)?(?:const\s+)?enum\s+([\p{L}_$][\p{L}\p{N}_$]*)/u },
   ];
 
-  const lines = masked.split('\n');
+
   const localSymbols = new Map<string, { line: number; kind: string }>();
   for (let i = 0; i < lines.length; i += 1) {
     const text = lines[i] ?? '';
@@ -521,13 +662,8 @@ function indexCodeFile(
   }
 }
 
-function indexDocFile(
-  rel: string,
-  source: string,
-  addNode: AddNode,
-  addEdge: AddEdge,
-  pendingLinks: PendingLink[],
-): void {
+function indexDocFile(rel: string, source: string, ctx: IndexContext): void {
+  const { addNode, addEdge, pendingLinks } = ctx;
   const fileKey = `file:${rel}`;
   const ext = posix.extname(rel).toLowerCase();
   addNode({
@@ -593,19 +729,19 @@ export function extractLinkTargets(line: string): string[] {
   return out;
 }
 
-function resolveLink(
-  link: PendingLink,
-  relPaths: Set<string>,
-  headingKeys: Set<string>,
-  addEdge: AddEdge,
-): void {
+function resolveLink(link: PendingLink, headingKeys: Set<string>, refs: ReferenceContext): void {
+  const { relPaths, addEdge } = refs;
   const raw = link.target.trim();
   if (!raw) return;
 
-  // Relative module specifiers: always a file-to-file `imports` edge.
+  // Module specifiers: a file-to-file `imports` edge, plus `references` edges
+  // from the importer to each symbol the import clause uses.
   if (link.edge === 'imports') {
-    const target = resolveRelative(link.fromPath, raw, relPaths);
-    if (target) addEdge(link.fromKey, `file:${target}`, 'imports', link.line);
+    const target = link.resolved ?? resolveRelative(link.fromPath, raw, relPaths);
+    if (target) {
+      addEdge(link.fromKey, `file:${target}`, 'imports', link.line);
+      addReferenceEdges(link, target, refs);
+    }
     return;
   }
 
@@ -631,21 +767,106 @@ function resolveLink(
   }
 }
 
-/** Resolve a relative module/link specifier to a workspace-relative path. */
-export function resolveRelative(
-  fromRel: string,
-  spec: string,
-  known: Set<string>,
-): string | null {
-  const fromDir = posix.dirname(fromRel);
-  const clean = spec.replace(/[?#].*$/, '');
-  let base = posix.normalize(posix.join(fromDir, clean));
-  if (base.startsWith('../')) return null; // outside the workspace
-  base = base.replace(/^\.\//, '').replace(/\/$/, '');
+/**
+ * Add `references` edges (importer file → exported symbol) for a resolved
+ * module import: named imports, default imports, and namespace imports
+ * (which reference every export of the target file).
+ */
+function addReferenceEdges(link: PendingLink, targetRel: string, refs: ReferenceContext): void {
+  const imports = link.imports;
+  if (!imports) return;
+  if (imports.names.length > 0) {
+    for (const name of imports.names) {
+      const key = `symbol:${targetRel}#${name}`;
+      if (refs.nodes.has(key)) refs.addEdge(link.fromKey, key, 'references', link.line);
+    }
+  }
+  if (imports.defaultImport) {
+    const symbol = defaultExportSymbol(targetRel, refs);
+    if (symbol) refs.addEdge(link.fromKey, symbol.key, 'references', link.line);
+  }
+  if (imports.namespace) {
+    for (const symbol of refs.exportedByFile.get(targetRel) ?? []) {
+      refs.addEdge(link.fromKey, symbol.key, 'references', link.line);
+    }
+  }
+}
 
+/**
+ * The symbol a `import X from …` statement refers to: the named declaration
+ * on the `export default` line when there is one, otherwise a synthetic
+ * `#default` symbol node so default imports still have something to cite.
+ */
+function defaultExportSymbol(targetRel: string, refs: ReferenceContext): ParsedNode | null {
+  const info = refs.defaultExports.get(targetRel);
+  const named = info ? refs.symbolByLine.get(`${targetRel}:${info.line}`) : undefined;
+  if (named) return named;
+  const key = `symbol:${targetRel}#default`;
+  const existing = refs.nodes.get(key);
+  if (existing) return existing;
+  const line = info?.line ?? 1;
+  const node: ParsedNode = {
+    key,
+    kind: 'symbol',
+    name: 'default',
+    path: targetRel,
+    line,
+    content: snippet(info?.text ?? null, 300),
+    tags: ['symbol', 'exported', 'synthetic', 'default'],
+    meta: { symbolKind: 'default', exported: true, synthetic: true },
+  };
+  refs.addNode(node);
+  refs.addEdge(`file:${targetRel}`, key, 'defines', line);
+  refs.addEdge(`file:${targetRel}`, key, 'exports', line);
+  return node;
+}
+
+/**
+ * Parse an import clause (`X, { a as b }` before `from`) or a `require`
+ * line into the symbols it uses. `as` aliases map to the exported name;
+ * `import type` counts like any other import.
+ */
+export function parseImportedNames(
+  clause: string | null | undefined,
+  requireLine: string | null | undefined,
+): ImportedNames {
+  const result: ImportedNames = { defaultImport: false, namespace: false, names: [] };
+  if (clause) {
+    const text = clause.replace(/\s+from\s*$/, '').trim();
+    applyClauseText(text, result);
+  } else if (requireLine) {
+    const destructured = /(?:const|let|var)\s+\{([^}]*)\}\s*=/.exec(requireLine);
+    if (destructured?.[1] !== undefined) {
+      for (const part of destructured[1].split(',')) {
+        const name = part.trim().split(':')[0]?.trim();
+        if (name && /^[\p{L}_$][\p{L}\p{N}_$]*$/u.test(name)) result.names.push(name);
+      }
+    } else if (/(?:const|let|var)\s+[\p{L}_$][\p{L}\p{N}_$]*\s*=\s*require\s*\(/u.test(requireLine)) {
+      result.defaultImport = true;
+    }
+  }
+  return result;
+}
+
+function applyClauseText(text: string, result: ImportedNames): void {
+  const braces = /\{([^}]*)\}/.exec(text);
+  if (braces?.[1] !== undefined) {
+    for (const part of braces[1].split(',')) {
+      const raw = part.trim().replace(/^type\s+/, '');
+      const exported = raw.split(/\s+as\s+/)[0]?.trim();
+      if (exported && /^[\p{L}_$][\p{L}\p{N}_$]*$/u.test(exported)) result.names.push(exported);
+    }
+  }
+  if (/\*\s*as\s+[\p{L}_$][\p{L}\p{N}_$]*/u.test(text)) result.namespace = true;
+  const before = braces ? text.slice(0, braces.index) : text;
+  if (/^[\p{L}_$][\p{L}\p{N}_$]*\s*(,|$)/u.test(before.trim())) result.defaultImport = true;
+}
+
+/** Candidate workspace-relative paths for a specifier base, in priority order. */
+function candidatesFor(base: string): string[] {
   const candidates: string[] = [];
   const push = (c: string): void => {
-    if (!candidates.includes(c)) candidates.push(c);
+    if (c && !candidates.includes(c)) candidates.push(c);
   };
 
   push(base);
@@ -666,11 +887,163 @@ export function resolveRelative(
   for (const ext of ['.ts', '.tsx', '.js', '.jsx', '.md']) {
     push(`${base}/index${ext}`);
   }
+  return candidates;
+}
 
-  for (const candidate of candidates) {
+/** Resolve a relative module/link specifier to a workspace-relative path. */
+export function resolveRelative(
+  fromRel: string,
+  spec: string,
+  known: Set<string>,
+): string | null {
+  const fromDir = posix.dirname(fromRel);
+  const clean = spec.replace(/[?#].*$/, '');
+  let base = posix.normalize(posix.join(fromDir, clean));
+  if (base.startsWith('../')) return null; // outside the workspace
+  base = base.replace(/^\.\//, '').replace(/\/$/, '');
+  for (const candidate of candidatesFor(base)) {
     if (known.has(candidate)) return candidate;
   }
   return null;
+}
+
+/** Resolve an already workspace-relative base (alias target, package entry). */
+export function resolveFromRoot(base: string, known: Set<string>): string | null {
+  const clean = toPosix(base).replace(/^\.\//, '').replace(/\/+$/, '');
+  if (!clean || clean.startsWith('../')) return null;
+  for (const candidate of candidatesFor(posix.normalize(clean))) {
+    if (known.has(candidate)) return candidate;
+  }
+  return null;
+}
+
+/* ------------------------------------------------------------------ */
+/* tsconfig paths aliases                                              */
+/* ------------------------------------------------------------------ */
+
+/** A `compilerOptions.paths` mapping, resolved against the workspace root. */
+export interface AliasMap {
+  /** Workspace-relative base every substitution is joined to ('' = root). */
+  baseUrl: string;
+  /** `pattern` keeps its `*`; `subs` are the path substitutions. */
+  patterns: { pattern: string; subs: string[] }[];
+}
+
+/**
+ * Read `baseUrl` and `paths` from the root tsconfig/jsconfig, following the
+ * `extends` chain (local files only; node_modules extends are ignored).
+ * Returns null when no usable `paths` mapping exists.
+ */
+export function loadAliasMap(root: string): AliasMap | null {
+  const configs: { dir: string; compilerOptions: Record<string, unknown> }[] = [];
+  const seen = new Set<string>();
+  let configPath = join(root, 'tsconfig.json');
+  if (!existsSync(configPath)) configPath = join(root, 'jsconfig.json');
+  while (existsSync(configPath) && !seen.has(configPath) && configs.length < 6) {
+    seen.add(configPath);
+    const parsed = parseJsonc(readFileSafe(configPath) ?? '');
+    if (!parsed) break;
+    const dir = dirname(configPath);
+    const co = parsed.compilerOptions;
+    configs.push({ dir, compilerOptions: co && typeof co === 'object' ? (co as Record<string, unknown>) : {} });
+    const ext = parsed.extends;
+    if (typeof ext !== 'string' || !ext.startsWith('.')) break;
+    configPath = resolve(dir, ext.endsWith('.json') ? ext : `${ext}.json`);
+  }
+  if (configs.length === 0) return null;
+
+  // Apply from the outermost ancestor down so nearer configs override.
+  let baseUrl = '.';
+  let paths: Record<string, string[]> | null = null;
+  for (let i = configs.length - 1; i >= 0; i -= 1) {
+    const { dir, compilerOptions } = configs[i]!;
+    if (typeof compilerOptions.baseUrl === 'string' && compilerOptions.baseUrl) {
+      const resolved = resolve(dir, compilerOptions.baseUrl);
+      baseUrl = relative(root, resolved);
+      if (baseUrl.startsWith('..')) return null; // baseUrl outside the workspace
+    }
+    if (compilerOptions.paths && typeof compilerOptions.paths === 'object') {
+      const map: Record<string, string[]> = {};
+      for (const [pattern, subs] of Object.entries(compilerOptions.paths as Record<string, unknown>)) {
+        if (Array.isArray(subs) && subs.every((s): s is string => typeof s === 'string')) {
+          map[pattern] = subs;
+        }
+      }
+      paths = map;
+    }
+  }
+  if (!paths || Object.keys(paths).length === 0) return null;
+  const normalizedBase = toPosix(baseUrl).replace(/^\.\//, '').replace(/\/+$/, '');
+  return {
+    baseUrl: normalizedBase === '.' ? '' : normalizedBase,
+    patterns: Object.entries(paths).map(([pattern, subs]) => ({ pattern, subs })),
+  };
+}
+
+/** Resolve a bare specifier through a paths mapping, or null. */
+export function resolveAlias(map: AliasMap, spec: string, known: Set<string>): string | null {
+  for (const { pattern, subs } of map.patterns) {
+    let middles: string[] | null = null;
+    const star = pattern.indexOf('*');
+    if (star >= 0) {
+      const prefix = pattern.slice(0, star);
+      const suffix = pattern.slice(star + 1);
+      if (spec.startsWith(prefix) && spec.endsWith(suffix) && spec.length >= prefix.length + suffix.length) {
+        const middle = spec.slice(prefix.length, spec.length - suffix.length);
+        middles = subs.map((sub) => (sub.includes('*') ? sub.replace('*', middle) : sub));
+      }
+    } else if (spec === pattern) {
+      middles = subs;
+    }
+    if (!middles) continue;
+    for (const middle of middles) {
+      const base = posix.normalize(posix.join(map.baseUrl || '.', middle));
+      const target = resolveFromRoot(base, known);
+      if (target) return target;
+    }
+  }
+  return null;
+}
+
+/** Parse JSONC: comments masked (strings preserved), trailing commas dropped. */
+function parseJsonc(text: string): Record<string, unknown> | null {
+  const masked = maskComments(text);
+  let out = '';
+  let inString = false;
+  let quote = '';
+  for (let i = 0; i < masked.length; i += 1) {
+    const ch = masked[i] as string;
+    if (inString) {
+      out += ch;
+      if (ch === '\\' && i + 1 < masked.length) {
+        out += (masked[i + 1] as string);
+        i += 1;
+      } else if (ch === quote) {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      inString = true;
+      quote = ch;
+      out += ch;
+      continue;
+    }
+    if (ch !== ',') {
+      out += ch;
+      continue;
+    }
+    let j = i + 1;
+    while (j < masked.length && /\s/.test(masked[j] as string)) j += 1;
+    const next = masked[j];
+    if (next === '}' || next === ']') continue; // drop the trailing comma
+    out += ch;
+  }
+  try {
+    return JSON.parse(out) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
 }
 
 /** `@scope/pkg/sub` -> `@scope/pkg`, `pkg/sub` -> `pkg`. */

@@ -6,8 +6,8 @@
 One SQLite file, five operators, `file:line` evidence for every answer.
 
 ```
-npx -y sqlite-graph-mcp index
-npx -y sqlite-graph-mcp plan 'find "walker" kind=symbol | walk type=defines dir=in depth=1 | filter kind=file'
+npx -y @developjik/sqlite-graph-mcp index
+npx -y @developjik/sqlite-graph-mcp plan 'find "walker" kind=symbol | walk type=defines dir=in depth=1 | filter kind=file'
 # → src/graph/walker.ts:1
 ```
 
@@ -42,28 +42,32 @@ it", the claim comes with a path and a line number.
 
 | Edge type | Meaning |
 | --- | --- |
-| `imports` | file → file (static `import`, `export … from`, `require`, dynamic `import()`) |
+| `imports` | file → file (static `import`, `export … from`, `require`, dynamic `import()`), including tsconfig `paths` aliases and workspace-local package entries |
 | `exports` | file → symbol (declaration is exported) |
 | `defines` | file → symbol, file → heading, `package.json` → its package |
 | `links_to` | Markdown link/reference → file or heading, including `#anchors` |
 | `depends_on` | file → package, package → dependency from the manifest |
+| `references` | file → symbol: the file imports that symbol (named, default, namespace, `export … from`, destructured `require`) |
 
 Files are tagged (`code`, `ts`, `doc`, `test`, `entry`, `manifest`, `exported`, …), and tags are
 filterable — that is how `graph_orphans` can skip test and entry files without extra arguments.
 
 ## Install
 
-Requires Node.js **20+** (tested on 20 and 22). `better-sqlite3` ships prebuilt binaries.
+The package is published as **`@developjik/sqlite-graph-mcp`** (the unscoped name on npm is an
+unrelated project, so always use the scope). Requires Node.js **20+** (tested on 20 and 22);
+`better-sqlite3` ships prebuilt binaries. After installing, the binary is `sqlite-graph-mcp`
+(or the alias `sqlite-graph`).
 
 ```bash
 # run without installing
-npx -y sqlite-graph-mcp --help
+npx -y @developjik/sqlite-graph-mcp --help
 
 # or install globally
-npm install -g sqlite-graph-mcp
+npm install -g @developjik/sqlite-graph-mcp
 
 # or as a dependency
-npm install sqlite-graph-mcp
+npm install @developjik/sqlite-graph-mcp
 ```
 
 ## MCP setup
@@ -72,9 +76,8 @@ The server speaks MCP over stdio. `--root` is the workspace to index; it default
 process's current directory, which is usually what an MCP client gives you.
 
 ### Claude Code
-
 ```bash
-claude mcp add sqlite-graph -- npx -y sqlite-graph-mcp serve --root /absolute/path/to/repo
+claude mcp add sqlite-graph -- npx -y @developjik/sqlite-graph-mcp serve --root /absolute/path/to/repo
 ```
 
 ### Cursor (`~/.cursor/mcp.json`)
@@ -84,7 +87,7 @@ claude mcp add sqlite-graph -- npx -y sqlite-graph-mcp serve --root /absolute/pa
   "mcpServers": {
     "sqlite-graph": {
       "command": "npx",
-      "args": ["-y", "sqlite-graph-mcp", "serve", "--root", "/absolute/path/to/repo"]
+      "args": ["-y", "@developjik/sqlite-graph-mcp", "serve", "--root", "/absolute/path/to/repo"]
     }
   }
 }
@@ -95,7 +98,7 @@ claude mcp add sqlite-graph -- npx -y sqlite-graph-mcp serve --root /absolute/pa
 ```toml
 [mcp_servers.sqlite-graph]
 command = "npx"
-args = ["-y", "sqlite-graph-mcp", "serve", "--root", "/absolute/path/to/repo"]
+args = ["-y", "@developjik/sqlite-graph-mcp", "serve", "--root", "/absolute/path/to/repo"]
 ```
 
 ### Claude Desktop (`claude_desktop_config.json`)
@@ -105,7 +108,7 @@ args = ["-y", "sqlite-graph-mcp", "serve", "--root", "/absolute/path/to/repo"]
   "mcpServers": {
     "sqlite-graph": {
       "command": "npx",
-      "args": ["-y", "sqlite-graph-mcp", "serve", "--root", "/absolute/path/to/repo"]
+      "args": ["-y", "@developjik/sqlite-graph-mcp", "serve", "--root", "/absolute/path/to/repo"]
     }
   }
 }
@@ -195,6 +198,20 @@ SELECT id, MIN(depth) AS depth FROM walk GROUP BY id ORDER BY depth, id;
 ```
 
 Direction `in` finds dependents ("who breaks if I rename this?"), `both` finds the neighbourhood.
+`references` edges make the rename question concrete — walk them inbound from a symbol to list
+every file whose import uses it:
+
+```jsonc
+// graph_walk { "start": ["symbol:src/graph/walker.ts#walkGraph"], "edgeType": "references", "direction": "in" }
+{
+  "count": 3,
+  "nodes": [
+    { "key": "symbol:src/graph/walker.ts#walkGraph", "depth": 0, "citation": "src/graph/walker.ts:7" },
+    { "key": "file:src/index.ts",                    "depth": 1, "citation": "src/index.ts:2" },
+    { "key": "file:src/graph/walker.test.ts",        "depth": 1, "citation": "src/graph/walker.test.ts:3" }
+  ]
+}
+```
 
 ### `graph_filter`
 
@@ -266,7 +283,7 @@ Pipeline syntax:
 | Step | Options |
 | --- | --- |
 | `find <query>` | `kind=file,symbol`, `limit=20`; `*` lists all, `*.ts` is a glob |
-| `walk` | `type=imports,links_to`, `dir=out|in|both`, `depth=6`, `start=<id>,<key>`, `limit=` |
+| `walk` | `type=imports,links_to,references`, `dir=out|in|both`, `depth=6`, `start=<id>,<key>`, `limit=` |
 | `filter` | `kind=`, `notKind=`, `path=src/**`, `prefix=`, `suffix=`, `name=`, `regex=`, `tag=`, `limit=` |
 | `minus find <query>` | subtract another find from the current set |
 
@@ -293,10 +310,14 @@ Being honest about a heuristic indexer matters more than a longer feature list:
 - **No AST.** Imports, exports and declarations are extracted with comment-masked regular
   expressions, not a TypeScript parser. Multi-line declarations are handled; exotic syntax and
   computed export names are not.
-- **No cross-file symbol references.** There is no `references` edge yet, so `walk` from a symbol
-  reaches its file and package, not every call site.
-- **No type resolution.** Path aliases (`@/…`, `tsconfig` `paths`) are not resolved; only relative
-  specifiers and workspace files.
+- **References come from import clauses, not call sites.** A `references` edge is created for
+  every named, default, namespace or destructured-`require` import (so "who uses this symbol?"
+  is really "whose import clause names it?"). Identifier-level usage inside a file — calls,
+  reassignments, JSX — is not tracked, and a dynamic `import()` only links files.
+- **Type resolution is partial.** tsconfig/jsconfig `paths` + `baseUrl` (local `extends` chains)
+  and workspace-local packages (`main`/`module`/`index`) resolve to real files; the package.json
+  `exports` field, bundler-config aliases (vite/webpack), `#`-prefixed package-internal imports
+  and tsconfigs in nested workspaces do not.
 - **Unchanged files are re-parsed.** Re-indexing is a full atomic rebuild (fast, but not
   incremental).
 - **Local scope only.** `node_modules`, `dist`, `build`, `.git` and friends are skipped, as are
@@ -316,7 +337,7 @@ Layout:
 ```
 bin/cli.ts        CLI entry (shebang, subcommands, JSON output)
 src/db.ts         schema, FTS5 index, GraphStore (prepared statements)
-src/indexer.ts    workspace scan, comment masking, symbol/import/heading extraction
+src/indexer.ts    workspace scan, comment masking, symbol/import/heading extraction, tsconfig paths, workspace packages
 src/query.ts      find / walk / filter / minus / orphans over SQLite
 src/plan.ts       pipeline DSL parser + answer executor with citations
 src/mcp.ts        MCP server and six tools
@@ -324,7 +345,9 @@ test/             fixtures, unit tests, stdio MCP protocol tests
 ```
 
 The test suite covers indexer counts and idempotency, extension remapping (`.js` import →
-`.ts` source), cycle-safe traversal, every operator, the plan DSL, orphan detection, the CLI, and
+`.ts` source), `references` edges (named/default/namespace imports, synthetic default exports),
+tsconfig `paths` aliases and workspace-local packages (see `test/fixtures/mono`), schema-version
+migration, cycle-safe traversal, every operator, the plan DSL, orphan detection, the CLI, and
 the MCP handshake both through the official SDK client and as raw newline-delimited JSON-RPC.
 
 ## License
