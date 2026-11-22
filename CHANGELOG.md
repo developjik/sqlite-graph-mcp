@@ -1,6 +1,15 @@
 # Changelog
 
 
+## 0.5.0 (2026-11-22)
+
+- **References accuracy overhaul (#5).** The references index now tracks
+  type-only positions, shorthand and computed-value forms, and resolves
+  barrel / package-specifier imports — removing the alias-import false edges
+  and `export *` phantom edges that inflated earlier counts. `--max-files`
+  rejects invalid values instead of silently returning an empty graph.
+  Reproduction on three real repositories holds precision at 100%.
+
 ## 0.4.0 (2026-11-22)
 
 - **`graph_diff`: what breaks between two revisions.** Indexes two workspace
