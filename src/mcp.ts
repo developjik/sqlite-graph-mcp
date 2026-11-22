@@ -6,13 +6,14 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 
 import { GraphStore, defaultDbPath } from './db.js';
+import { diffWorkspaces } from './diff.js';
 import { indexWorkspace } from './indexer.js';
 import { executePlan, parsePlan } from './plan.js';
 import { filterNodes, findNodes, findOrphans, toEdgeViews, toNodeView, walkNodes } from './query.js';
 import { EDGE_TYPES, NODE_KINDS, type IndexStats } from './types.js';
 
 export const SERVER_NAME = 'sqlite-graph-mcp';
-export const SERVER_VERSION = '0.3.0';
+export const SERVER_VERSION = '0.4.0';
 
 export interface GraphServerOptions {
   /** Workspace root to index. Defaults to `process.cwd()`. */
@@ -332,6 +333,35 @@ export function createGraphServer(options: GraphServerOptions = {}): GraphServer
     },
   );
 
+
+  server.registerTool(
+    'graph_diff',
+    {
+      title: 'Diff two revisions',
+      description:
+        'Index two workspace states and answer "what breaks if we ship head?": symbols that are ' +
+        'removed or no longer exported while other files still referenced them (with importer ' +
+        'citations), files that lost their last inbound edge, and node/edge counts. Each side is ' +
+        'a git revision (branch, tag, SHA — verified, no shell) or a directory path.',
+      inputSchema: {
+        base: z.string().describe('Base side: git rev (e.g. "main") or a directory path.'),
+        head: z.string().describe('Head side: git rev (e.g. "HEAD" or a PR SHA) or a directory path.'),
+        engine: z.enum(['ast', 'heuristic']).optional().describe('Extraction engine. Default: ast.'),
+        limit: z.number().int().min(1).max(500).optional().describe('Cap per list (default 50; counts stay exact).'),
+      },
+    },
+    async (args) => {
+      try {
+        const diff = await diffWorkspaces(root, args.base, args.head, {
+          engine: args.engine,
+          limit: args.limit,
+        });
+        return jsonContent(diff);
+      } catch (error) {
+        return errorContent((error as Error).message);
+      }
+    },
+  );
   return {
     server,
     get store() {

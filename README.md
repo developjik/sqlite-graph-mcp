@@ -246,6 +246,42 @@ are never exported. Test and entry files are excluded unless you ask for them.
 }
 ```
 
+### `graph_diff` — what breaks if we ship this?
+
+Indexes two workspace states and compares the graphs. Each side is a git revision
+(branch, tag, SHA — verified with `git rev-parse`, no shell) or a plain directory:
+
+```jsonc
+// graph_diff { "base": "main", "head": "HEAD" }
+{
+  "counts": { "addedNodes": 14, "removedNodes": 3, "addedEdges": 41, "removedEdges": 9,
+              "breaking": 1, "newOrphans": 1 },
+  "breaking": [
+    {
+      "symbol": { "key": "symbol:src/graph/walker.ts#walkGraph", "citation": "src/graph/walker.ts:7" },
+      "unexportedOnly": true,
+      "importers": [
+        { "key": "file:src/index.ts", "citation": "src/index.ts:9" },
+        { "key": "file:src/graph/walker.test.ts", "citation": "src/graph/walker.test.ts:6" }
+      ]
+    }
+  ],
+  "newOrphans": [{ "key": "file:src/legacy.ts", "citation": "src/legacy.ts:1" }],
+  "truncated": false
+}
+```
+
+**breaking** lists every symbol the head no longer exports (removed or un-exported)
+while base-side files were still using it, with the importer citations — the
+mechanical answer to "is this PR safe to merge?". **newOrphans** lists files
+that kept existing but lost their last inbound `imports`/`links_to` edge.
+The CLI form doubles as a review gate:
+
+```bash
+sqlite-graph-mcp diff main HEAD --check   # exit 3 when a breaking change is found
+```
+
+
 ### `graph_plan` — chain them
 
 A plan is a pipeline. Each step consumes the previous step's node set; `find` starts a new set.
