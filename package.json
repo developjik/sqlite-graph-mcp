@@ -47,7 +47,8 @@
     "vendor:wasm": "cp node_modules/tree-sitter-wasms/out/tree-sitter-typescript.wasm node_modules/tree-sitter-wasms/out/tree-sitter-tsx.wasm vendor/",
     "test:watch": "vitest",
     "start": "node dist/bin/cli.js serve",
-    "prepublishOnly": "npm run typecheck && npm run build && npm test"
+    "prepublishOnly": "npm run typecheck && npm run build && npm test",
+    "test:coverage": "vitest run --coverage"
   },
   "keywords": [
     "mcp",
@@ -68,6 +69,7 @@
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^20.19.9",
+    "@vitest/coverage-v8": "^2.1.9",
     "tree-sitter-wasms": "^0.1.13",
     "typescript": "^5.9.3",
     "vitest": "^2.1.9"
