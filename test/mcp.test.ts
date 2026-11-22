@@ -6,6 +6,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { beforeAll, describe, expect, it } from 'vitest';
 
+import { GraphStore } from '../src/db.js';
 import { cliPath, fixtureRoot, repoRoot, tempDir } from './helpers.js';
 
 beforeAll(() => {
@@ -338,6 +339,46 @@ describe('CLI', () => {
     });
     expect(help).toContain('Operator 5');
     expect(help).toContain('--root');
+  });
+
+  it('rejects invalid --max-files values without touching an existing index', () => {
+    const dir = tempDir('cli-maxfiles');
+    try {
+      const dbPath = join(dir, 'index.db');
+      execFileSync(process.execPath, [cliPath, 'index', fixtureRoot, '--db', dbPath], {
+        cwd: repoRoot,
+      });
+      const before = new GraphStore(dbPath);
+      const nodeCount = before.countNodes();
+      before.close();
+      expect(nodeCount).toBeGreaterThan(0);
+
+      for (const args of [
+        ['--max-files=0'],
+        ['--max-files=-3'],
+        ['--max-files=abc'],
+        ['--max-files=2.5'],
+        ['--max-files'],
+      ]) {
+        let status = 0;
+        try {
+          execFileSync(
+            process.execPath,
+            [cliPath, 'index', fixtureRoot, '--db', dbPath, ...args],
+            { cwd: repoRoot, stdio: 'pipe' },
+          );
+        } catch (error) {
+          status = (error as { status?: number }).status ?? -1;
+        }
+        expect(status).not.toBe(0);
+      }
+
+      const after = new GraphStore(dbPath);
+      expect(after.countNodes()).toBe(nodeCount);
+      after.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('exits 1 when a search finds nothing', () => {

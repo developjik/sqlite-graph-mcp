@@ -132,6 +132,8 @@ export interface IndexStats {
   dbPath: string;
   files: number;
   skippedFiles: number;
+  /** Indexable files left out because the `maxFiles` cap was reached. */
+  cappedFiles: number;
   nodes: Record<NodeKind, number> & { total: number };
   edges: Record<EdgeType, number> & { total: number };
   /** Which extraction engine actually ran. */

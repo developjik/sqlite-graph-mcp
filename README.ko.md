@@ -49,7 +49,7 @@ npx -y @developjik/sqlite-graph-mcp plan 'find "walker" kind=symbol | walk type=
 | `defines` | file → symbol, file → heading, `package.json` → 그 패키지 |
 | `links_to` | 마크다운 링크/참조 → file 또는 heading, `#앵커` 포함 |
 | `depends_on` | file → package, 매니페스트의 package → 의존성 |
-| `references` | file → symbol: 그 파일이 이 심볼을 **실제로 사용** (네임드/디폴트/네임스페이스/`require` 바인딩 기준, 미사용 import는 엣지 없음) |
+| `references` | file → symbol: 그 파일이 이 심볼을 **실제로 사용** (네임드/디폴트/네임스페이스/`require` 바인딩 기준, 미사용 import도 import 라인에 엣지 인용) |
 
 파일에는 태그가 붙고(`code`, `ts`, `doc`, `test`, `entry`, `manifest`, `exported`, …) 태그로
 필터할 수 있습니다 — `graph_orphans`가 별도 인자 없이 테스트·엔트리 파일을 건너뛰는 것도
@@ -60,7 +60,8 @@ npx -y @developjik/sqlite-graph-mcp plan 'find "walker" kind=symbol | walk type=
 기본 **`ast` 엔진**은 tree-sitter WASM 문법(패키지에 동봉)으로 TypeScript/TSX(및 일반
 JS)를 실제 파싱합니다 — 네이티브 빌드도, 네트워크도 필요 없습니다. Import·심볼·export는
 파스 트리에서 나오고, `references` 엣지는 import한 바인딩을 **처음 실제 사용한 줄**에
-인용합니다. WASM 로드에 실패하면 색인은 **`heuristic` 엔진**(주석 마스킹 정규식,
+인용합니다 — import만 하고 사용하지 않는 바인딩은 import 라인에 인용합니다(절 자체가
+리네임에 깨지는 텍스트 위치이므로). WASM 로드에 실패하면 색인은 **`heuristic` 엔진**(주석 마스킹 정규식,
 import 절 기반 references)으로 자동 폴백됩니다. 명시적으로 지정하려면
 `graph_index { engine: "heuristic" }` 또는 `--engine heuristic`; 색인 결과의
 `engine` 필드가 실제로 어떤 엔진이 돌았는지 알려줍니다.
@@ -393,8 +394,8 @@ test/             fixtures, 단위 테스트, stdio MCP 프로토콜 테스트
 ```
 
 테스트 스위트는 인덱서 개수와 멱등성, 확장자 리매핑 (`.js` import → `.ts` 소스),
-사용 기반 `references` (별칭/디폴트/네임스페이스 바인딩, 미사용 import는 엣지 없음,
-합성 디폴트 export), 두 엔진 전부, tsconfig `paths` 별칭과 워크스페이스 로컬 패키지
+사용 기반 `references` (별칭/디폴트/네임스페이스 바인딩, 미사용 import의 import 라인
+인용, 합성 디폴트 export), 두 엔진 전부, tsconfig `paths` 별칭과 워크스페이스 로컬 패키지
 (`test/fixtures/mono` 참고), 스키마 버전 마이그레이션, 사이클 안전 순회, 모든 연산자,
 플랜 DSL, 고아 검출, CLI, 그리고 공식 SDK 클라이언트와 줄바꿈 구분 JSON-RPC 양쪽으로의
 MCP 핸드셰이크를 다룹니다. `tree-sitter-wasms`를 올린 뒤에는 `npm run vendor:wasm`으로

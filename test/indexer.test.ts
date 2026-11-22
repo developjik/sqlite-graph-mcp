@@ -410,6 +410,37 @@ describe('refs fixture: type usage, barrels, package exports', () => {
     expect(refs).toContain('symbol:src/wraplib.ts#runNonInteractive');
   });
 
+  it('does not turn a renamed import into a same-named export reference', async () => {
+    const graph = await createFixtureGraph({ root: refsRoot });
+    graphs.push(graph);
+
+    // `import { read as load }` — `load()` calls `read`, never reader's `load`.
+    const refs = refsFrom(graph.store, 'file:src/aliasuse.ts');
+    expect(refs).toContain('symbol:src/reader.ts#read');
+    expect(refs).not.toContain('symbol:src/reader.ts#load');
+  });
+
+  it('keeps the real same-named import alongside an alias, in either clause order', async () => {
+    const graph = await createFixtureGraph({ root: refsRoot });
+    graphs.push(graph);
+
+    // `{ read as load, load as realLoad }` — the alias resolves to `read`
+    // while `realLoad` legitimately references the real `load` export.
+    for (const file of ['file:src/aliasmix.ts', 'file:src/aliasmix2.ts']) {
+      const refs = refsFrom(graph.store, file);
+      expect(refs).toContain('symbol:src/reader.ts#read');
+      expect(refs).toContain('symbol:src/reader.ts#load');
+    }
+
+    // Parity: the heuristic engine resolves only the imported name and so
+    // never produced the aliased-name edge.
+    const heuristic = await createFixtureGraph({ root: refsRoot, engine: 'heuristic' });
+    graphs.push(heuristic);
+    const refs = refsFrom(heuristic.store, 'file:src/aliasuse.ts');
+    expect(refs).toContain('symbol:src/reader.ts#read');
+    expect(refs).not.toContain('symbol:src/reader.ts#load');
+  });
+
   it('references members reached through a binding (`Wrap.Inner`)', async () => {
     const graph = await createFixtureGraph({ root: refsRoot });
     graphs.push(graph);

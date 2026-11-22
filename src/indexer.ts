@@ -165,6 +165,9 @@ export interface IndexResult {
  */
 export async function indexWorkspace(options: IndexOptions): Promise<IndexStats> {
   const started = Date.now();
+  if (options.maxFiles !== undefined && (!Number.isInteger(options.maxFiles) || options.maxFiles < 1)) {
+    throw new Error(`maxFiles must be a positive integer, got ${options.maxFiles}`);
+  }
   const root = resolve(options.root);
   if (!existsSync(root) || !statSync(root).isDirectory()) {
     throw new Error(`Workspace root is not a directory: ${root}`);
@@ -348,6 +351,7 @@ export async function indexWorkspace(options: IndexOptions): Promise<IndexStats>
       dbPath: toPosix(dbPath),
       files: collected.files.length,
       skippedFiles: collected.skipped,
+      cappedFiles: collected.capped,
       nodes: {
         file: counts['node:file'] ?? 0,
         symbol: counts['node:symbol'] ?? 0,
@@ -387,6 +391,8 @@ interface CollectedFiles {
   /** `tsconfig*.json`/`jsconfig*.json` paths (workspace-relative, all depths). */
   configs: string[];
   skipped: number;
+  /** Indexable files skipped only because `maxFiles` was reached. */
+  capped: number;
 }
 
 const TSCONFIG_NAME = /^[tj]sconfig(?:\.[^/]*)?\.json$/i;
@@ -398,6 +404,7 @@ export function collectFiles(root: string, options: IndexOptions): CollectedFile
   const files: { abs: string; rel: string; size: number }[] = [];
   const configs: string[] = [];
   let skipped = 0;
+  let capped = 0;
 
   const walk = (dir: string): void => {
     let entries;
@@ -408,11 +415,11 @@ export function collectFiles(root: string, options: IndexOptions): CollectedFile
     }
     entries.sort((a, b) => a.name.localeCompare(b.name));
     for (const entry of entries) {
-      const capped = files.length >= maxFiles;
+      const atCap = files.length >= maxFiles;
       const abs = join(dir, entry.name);
       const rel = toPosix(relative(root, abs));
       if (entry.isSymbolicLink()) {
-        if (!capped) skipped += 1;
+        if (!atCap) skipped += 1;
         continue;
       }
       if (entry.isDirectory()) {
@@ -424,11 +431,14 @@ export function collectFiles(root: string, options: IndexOptions): CollectedFile
       if (!entry.isFile()) continue;
       // Past the file cap the walk continues — but only to find tsconfig files.
       if (TSCONFIG_NAME.test(entry.name)) configs.push(rel.split(sep).join('/'));
-      if (capped) continue;
-      if (extraIgnore.has(rel) || extraIgnore.has(entry.name)) continue;
       const ext = posix.extname(entry.name).toLowerCase();
       const isManifest = entry.name === 'package.json';
       if (!isManifest && !CODE_EXTENSIONS.has(ext) && !DOC_EXTENSIONS.has(ext)) continue;
+      if (extraIgnore.has(rel) || extraIgnore.has(entry.name)) continue;
+      if (atCap) {
+        capped += 1;
+        continue;
+      }
       let size = 0;
       try {
         size = statSync(abs).size;
@@ -445,7 +455,7 @@ export function collectFiles(root: string, options: IndexOptions): CollectedFile
   };
 
   walk(root);
-  return { files, configs, skipped };
+  return { files, configs, skipped, capped };
 }
 
 /** Shared context for the per-file indexing passes. */
@@ -1213,10 +1223,6 @@ function addAstReferenceEdges(
     const line = binding.usedAtLine ?? ast.line;
     const key = resolveSymbolTarget(targetRel, binding.imported, refs);
     if (key) refs.addEdge(fromKey, key, 'references', line);
-    if (binding.local !== binding.imported) {
-      const aliasKey = resolveSymbolTarget(targetRel, binding.local, refs);
-      if (aliasKey && aliasKey !== key) refs.addEdge(fromKey, aliasKey, 'references', line);
-    }
     const homeRel = key ? key.slice('symbol:'.length, key.indexOf('#')) : undefined;
     addProps(binding.props, binding.imported, homeRel);
   }
