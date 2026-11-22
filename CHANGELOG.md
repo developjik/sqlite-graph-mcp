@@ -1,5 +1,17 @@
 # Changelog
 
+
+## 0.4.0 (2026-11-22)
+
+- **`graph_diff`: what breaks between two revisions.** Indexes two workspace
+  states and compares the graphs — each side is a git revision (verified with
+  `git rev-parse`, materialized with `git archive`, no shell) or a directory.
+  **breaking** lists symbols the head no longer exports while base-side files
+  still referenced them, with importer citations at the usage lines;
+  **newOrphans** lists files that lost their last inbound edge. Available as
+  the `graph_diff` MCP tool and `sqlite-graph-mcp diff <base> <head>`;
+  `--check` exits 3 on breaking changes for review gates.
+
 ## 0.3.0 (2026-11-22)
 
 - **tree-sitter (WASM) extraction engine, on by default.** Imports, symbols and

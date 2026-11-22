@@ -249,6 +249,41 @@ import한 파일 전부가 나옵니다:
 }
 ```
 
+### `graph_diff` — 이 변경을 배포하면 무엇이 깨질까?
+
+두 워크스페이스 상태를 각각 색인해 그래프를 비교합니다. 각 쪽은 git 리비전(브랜치·태그·SHA
+— `git rev-parse`로 검증, 셸 없음) 또는 그냥 디렉터리입니다:
+
+```jsonc
+// graph_diff { "base": "main", "head": "HEAD" }
+{
+  "counts": { "addedNodes": 14, "removedNodes": 3, "addedEdges": 41, "removedEdges": 9,
+              "breaking": 1, "newOrphans": 1 },
+  "breaking": [
+    {
+      "symbol": { "key": "symbol:src/graph/walker.ts#walkGraph", "citation": "src/graph/walker.ts:7" },
+      "unexportedOnly": true,
+      "importers": [
+        { "key": "file:src/index.ts", "citation": "src/index.ts:9" },
+        { "key": "file:src/graph/walker.test.ts", "citation": "src/graph/walker.test.ts:6" }
+      ]
+    }
+  ],
+  "newOrphans": [{ "key": "file:src/legacy.ts", "citation": "src/legacy.ts:1" }],
+  "truncated": false
+}
+```
+
+**breaking**은 head에서 더 이상 export되지 않는(삭제되었거나 export가 제거된) 심볼 중
+base 쪽 파일들이 여전히 쓰고 있던 것을 import 인용과 함께 나열합니다 — "이 PR, 머지해도
+안전한가?"에 대한 기계 판정입니다. **newOrphans**는 살아있는데 마지막 inbound
+`imports`/`links_to` 엣지를 잃은 파일들입니다. CLI 형태는 리뷰 게이트로도 씁니다:
+
+```bash
+sqlite-graph-mcp diff main HEAD --check   # breaking이 있으면 exit 3
+```
+
+
 ### `graph_plan` — 체인으로 잇기
 
 플랜은 파이프라인입니다. 각 단계는 이전 단계의 노드 집합을 소비하고, `find`는 새 집합을

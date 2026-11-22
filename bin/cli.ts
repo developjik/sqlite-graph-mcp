@@ -17,6 +17,7 @@ import { GraphStore, defaultDbPath } from '../src/db.js';
 import { indexWorkspace } from '../src/indexer.js';
 import { runStdioServer, SERVER_NAME, SERVER_VERSION } from '../src/mcp.js';
 import { executePlan, parsePlan } from '../src/plan.js';
+import { diffWorkspaces } from '../src/diff.js';
 import { findNodes, findOrphans, toNodeView, walkNodes } from '../src/query.js';
 import type { NodeKind, NodeRef, WalkDirection } from '../src/types.js';
 
@@ -134,6 +135,7 @@ async function main(argv: string[]): Promise<number> {
           '  find <query>          Operator 1: text search (FTS5 + substring)',
           '  walk <ref...>         Operator 2: recursive-CTE traversal',
           '  plan <plan>           Operator 5: chained find|walk|filter|minus answer',
+          '  diff <base> <head>     Graph diff between two git revs or directories',
           '  orphans               Files with no inbound imports/links, unexported symbols',
           '',
           'Options:',
@@ -144,6 +146,7 @@ async function main(argv: string[]): Promise<number> {
           '  --type <edge>         imports|exports|defines|links_to|depends_on|references',
           '  --dir out|in|both     Walk direction (default: out)',
           '  --depth <n>           Walk depth (default: 6)',
+          '  --check               diff: exit 3 when a breaking change is found',
           '  --json                Machine-readable output',
           '',
           'Examples:',
@@ -262,6 +265,40 @@ async function main(argv: string[]): Promise<number> {
       } finally {
         store.close();
       }
+    }
+    case 'diff': {
+      if (positional.length < 2) {
+        throw new Error('diff needs two sides: sqlite-graph-mcp diff <base> <head> (git revs or directories)');
+      }
+      const [baseSpec, headSpec] = positional;
+      const diff = await diffWorkspaces(root, baseSpec as string, headSpec as string, {
+        engine: flags.engine === 'heuristic' ? 'heuristic' : undefined,
+        limit: typeof flags.limit === 'string' ? Number(flags.limit) : undefined,
+      });
+      if (json) {
+        process.stdout.write(`${JSON.stringify(diff, null, 2)}\n`);
+      } else {
+        const sideOf = (s: { rev: string | null; root: string }): string => s.rev ?? s.root;
+        process.stdout.write(`Diff ${sideOf(diff.base)} → ${sideOf(diff.head)}\n`);
+        process.stdout.write(
+          `  nodes: +${diff.counts.addedNodes} -${diff.counts.removedNodes}` +
+            `  edges: +${diff.counts.addedEdges} -${diff.counts.removedEdges}\n`,
+        );
+        for (const change of diff.breaking) {
+          const where = change.unexportedOnly ? 'no longer exported' : 'removed';
+          process.stdout.write(
+            `  BREAKING ${change.symbol.citation ?? change.symbol.key} (${change.symbol.name}) is ${where}; used by:\n`,
+          );
+          for (const importer of change.importers) {
+            process.stdout.write(`    - ${importer.citation ?? importer.key}\n`);
+          }
+        }
+        for (const orphan of diff.newOrphans) {
+          process.stdout.write(`  ORPHANED ${orphan.citation ?? orphan.key} (lost its last inbound edge)\n`);
+        }
+        if (diff.truncated) process.stdout.write('  (lists truncated — counts are exact)\n');
+      }
+      return flags.check === true && diff.counts.breaking > 0 ? 3 : 0;
     }
     case 'orphans': {
       const store = await openStore(root, flags);

@@ -53,6 +53,7 @@ describe('MCP server over stdio (SDK client)', () => {
       const tools = await client.listTools();
       const names = tools.tools.map((tool) => tool.name).sort();
       expect(names).toEqual([
+        'graph_diff',
         'graph_filter',
         'graph_find',
         'graph_index',
