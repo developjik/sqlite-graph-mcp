@@ -399,6 +399,17 @@ describe('refs fixture: type usage, barrels, package exports', () => {
     expect(dynRefs).not.toContain('symbol:src/dynmod.ts#default');
   });
 
+  it('binds destructured names through a wrapped dynamic import', async () => {
+    const graph = await createFixtureGraph({ root: refsRoot });
+    graphs.push(graph);
+
+    // `const { a, b } = await wrapPromise(() => import('./wraplib'))` — both
+    // bindings resolve to the module's exports despite the call wrapper.
+    const refs = refsFrom(graph.store, 'file:src/wrapimp.ts');
+    expect(refs).toContain('symbol:src/wraplib.ts#reportRunError');
+    expect(refs).toContain('symbol:src/wraplib.ts#runNonInteractive');
+  });
+
   it('references members reached through a binding (`Wrap.Inner`)', async () => {
     const graph = await createFixtureGraph({ root: refsRoot });
     graphs.push(graph);

@@ -441,15 +441,31 @@ export function parseFile(engine: AstEngine, source: string, ext: string): AstPa
       isReexport: false,
       named: [],
     };
-    // `const { x } = await import('…')` / `const m = require('…')` — only when
-    // the call is the declarator's value itself; an `import()` nested inside a
-    // function body or expression binds nothing.
+    // `const { x } = await import('…')` / `const m = require('…')` — the call
+    // is the declarator's value itself (modulo await/parens), so the pattern
+    // binds to the module outright.
     let parent = node.parent;
     while (parent && (parent.type === 'await_expression' || parent.type === 'parenthesized_expression')) {
       parent = parent.parent;
     }
     if (parent && parent.type === 'variable_declarator') {
       bindPattern(imp, parent.childForFieldName('name'));
+    } else {
+      // A literal import anywhere in a declarator's initializer can supply
+      // destructured names: `const { x } = yield* Effect.promise(() =>
+      // import('…'))` binds `x` to the module. Identifier patterns keep the
+      // strict rule — `const lazy = () => import('…')` binds a factory.
+      let child: WebNode = node;
+      let decl = node.parent;
+      while (decl && decl.type !== 'variable_declarator') {
+        child = decl;
+        decl = decl.parent;
+      }
+      const name = decl?.childForFieldName('name');
+      const value = decl?.childForFieldName('value');
+      if (decl && value && child.equals(value) && name?.type === 'object_pattern') {
+        bindPattern(imp, name);
+      }
     }
     imports.push(imp);
     return true;
