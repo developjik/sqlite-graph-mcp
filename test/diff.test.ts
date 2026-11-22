@@ -1,5 +1,6 @@
-import { cpSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { cpSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
@@ -14,7 +15,7 @@ afterEach(() => {
 
 function mutatedFixture(mutate: (dir: string) => void): string {
   const dir = join(tempDir('diff-fixture'), 'ws');
-  dirs.push(dirnameOf(dir));
+  dirs.push(dirname(dir));
   cpSync(fixtureRoot, dir, { recursive: true });
   mutate(dir);
   return dir;
@@ -24,12 +25,14 @@ function dirnameOf(path: string): string {
   return path.split('/').slice(0, -1).join('/');
 }
 
+function edit(path: string, from: string, to: string): void {
+  writeFileSync(path, readFileSync(path, 'utf8').replace(from, to));
+}
 describe('graph diff', () => {
   it('flags a removed export that other files still reference', async () => {
     const head = mutatedFixture((dir) => {
       // walkGraph is used by src/index.ts and walker.test.ts — drop the export.
-      const file = join(dir, 'src/graph/walker.ts');
-      writeFileSync(file, writeFileSync.length >= 0 ? read(file).replace('export function walkGraph', 'function walkGraph') : '');
+      edit(join(dir, 'src/graph/walker.ts'), 'export function walkGraph', 'function walkGraph');
     });
     const diff = await diffWorkspaces(repoRoot, fixtureRoot, head, { engine: 'heuristic' });
     expect(diff.counts.breaking).toBe(1);
@@ -81,13 +84,29 @@ describe('graph diff', () => {
   });
 
   it('diffs git revisions inside a repository', async () => {
-    // v0.2.0 → HEAD on this repository changed references semantics but kept
-    // every export, so nothing is breaking — while the raw counts moved a lot.
-    const diff = await diffWorkspaces(repoRoot, 'df96fe4', 'HEAD');
-    expect(diff.base.rev).toBe('df96fe4');
+    // A tiny two-commit repository, built here so the test never depends on
+    // the host checkout's history depth (CI clones are shallow).
+    const repo = join(tempDir('diff-git'), 'repo');
+    dirs.push(dirname(repo));
+    cpSync(fixtureRoot, repo, { recursive: true });
+    const git = (args: string[]): void => {
+      execFileSync('git', ['-C', repo, ...args], { stdio: 'pipe' });
+    };
+    git(['init', '-q']);
+    git(['config', 'user.email', 'test@example.com']);
+    git(['config', 'user.name', 'diff test']);
+    git(['add', '-A']);
+    git(['commit', '-q', '-m', 'base']);
+    edit(join(repo, 'src/graph/walker.ts'), 'export function walkGraph', 'function walkGraph');
+    git(['add', '-A']);
+    git(['commit', '-q', '-m', 'un-export walkGraph']);
+
+    const diff = await diffWorkspaces(repo, 'HEAD~1', 'HEAD');
+    expect(diff.base.rev).toBe('HEAD~1');
     expect(diff.head.rev).toBe('HEAD');
-    expect(diff.counts.addedNodes).toBeGreaterThan(0);
-    expect(diff.counts.breaking).toBe(0);
+    expect(diff.counts.breaking).toBe(1);
+    expect(diff.breaking[0]?.symbol.name).toBe('walkGraph');
+    expect(diff.counts.addedNodes).toBe(0);
   }, 30000);
 
   it('rejects an unknown git revision without touching anything', async () => {
