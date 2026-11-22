@@ -9,6 +9,7 @@ import type { GraphNode, IndexStats } from '../src/types.js';
 export const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 export const fixtureRoot = join(repoRoot, 'test', 'fixtures', 'ws');
 export const monoRoot = join(repoRoot, 'test', 'fixtures', 'mono');
+export const refsRoot = join(repoRoot, 'test', 'fixtures', 'refs');
 export const cliPath = join(repoRoot, 'dist', 'bin', 'cli.js');
 
 export interface FixtureGraph {

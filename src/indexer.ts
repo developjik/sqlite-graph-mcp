@@ -131,11 +131,23 @@ interface PendingLink {
   ast?: AstImport;
 }
 
+/** Re-exports of one file: named (`export { a as b }`) and star (`export *`). */
+interface FileReexports {
+  /** Re-exported name → source specifier and the name in that module. */
+  named: Map<string, { spec: string; imported: string }>;
+  /** `export * from '…'` specifiers. */
+  star: string[];
+}
+
 interface PackageInfo {
   name: string;
   version?: string;
-  /** `main`/`module` field, relative to the manifest. */
+  /** `main`/`module`/`exports['.']` field, relative to the manifest. */
   entry?: string;
+  /** `exports` subpath map (`'.'`, `'./sub'`, `'./*'` kept verbatim). */
+  exports?: Map<string, string>;
+  /** `imports` map (`#`-specifiers private to this package). */
+  imports?: Map<string, string>;
   external: boolean;
   dev: boolean;
   manifests: Set<string>;
@@ -161,13 +173,15 @@ export async function indexWorkspace(options: IndexOptions): Promise<IndexStats>
   const dbPath = options.dbPath ? resolve(options.dbPath) : defaultDbPath(root);
   const collected = collectFiles(root, options);
   const relPaths = new Set(collected.files.map((f) => f.rel));
-  const aliasMap = loadAliasMap(root);
+  const aliasMaps = loadAliasMaps(root, collected.configs);
   const astEngine = options.engine === 'heuristic' ? null : await getAstEngine();
 
   const nodes = new Map<string, ParsedNode>();
   const edges: ParsedEdge[] = [];
   const pendingLinks: PendingLink[] = [];
   const packages = new Map<string, PackageInfo>();
+  /** Re-export clauses per file, resolved lazily for barrel imports. */
+  const reexports = new Map<string, FileReexports>();
   /** First `export default` line per file, for default-import references. */
   const defaultExports = new Map<string, { line: number; text: string }>();
 
@@ -193,6 +207,14 @@ export async function indexWorkspace(options: IndexOptions): Promise<IndexStats>
     }
     if (patch.version) info.version = patch.version;
     if (patch.entry) info.entry = patch.entry;
+    if (patch.exports) {
+      if (!info.exports) info.exports = new Map();
+      for (const [k, v] of patch.exports) info.exports.set(k, v);
+    }
+    if (patch.imports) {
+      if (!info.imports) info.imports = new Map();
+      for (const [k, v] of patch.imports) info.imports.set(k, v);
+    }
     if (patch.external === false) info.external = false;
     if (patch.dev) info.dev = true;
     for (const m of patch.manifests ?? []) info.manifests.add(m);
@@ -201,11 +223,12 @@ export async function indexWorkspace(options: IndexOptions): Promise<IndexStats>
 
   const ctx: IndexContext = {
     relPaths,
-    aliasMap,
+    aliasMaps,
     astEngine,
     packages,
     pendingLinks,
     defaultExports,
+    reexports,
     addNode,
     addEdge,
     upsertPackage,
@@ -280,6 +303,7 @@ export async function indexWorkspace(options: IndexOptions): Promise<IndexStats>
     exportedByFile,
     symbolByLine,
     defaultExports,
+    reexports,
     addNode,
     addEdge,
   };
@@ -360,18 +384,22 @@ export function readFileSafe(abs: string): string | null {
 
 interface CollectedFiles {
   files: { abs: string; rel: string; size: number }[];
+  /** `tsconfig*.json`/`jsconfig*.json` paths (workspace-relative, all depths). */
+  configs: string[];
   skipped: number;
 }
+
+const TSCONFIG_NAME = /^[tj]sconfig(?:\.[^/]*)?\.json$/i;
 
 export function collectFiles(root: string, options: IndexOptions): CollectedFiles {
   const extraIgnore = new Set((options.ignore ?? []).map((p) => toPosix(p).replace(/^\.\//, '')));
   const maxFiles = options.maxFiles ?? 5000;
   const maxBytes = options.maxFileBytes ?? 512 * 1024;
   const files: { abs: string; rel: string; size: number }[] = [];
+  const configs: string[] = [];
   let skipped = 0;
 
   const walk = (dir: string): void => {
-    if (files.length >= maxFiles) return;
     let entries;
     try {
       entries = readdirSync(dir, { withFileTypes: true });
@@ -380,11 +408,11 @@ export function collectFiles(root: string, options: IndexOptions): CollectedFile
     }
     entries.sort((a, b) => a.name.localeCompare(b.name));
     for (const entry of entries) {
-      if (files.length >= maxFiles) return;
+      const capped = files.length >= maxFiles;
       const abs = join(dir, entry.name);
       const rel = toPosix(relative(root, abs));
       if (entry.isSymbolicLink()) {
-        skipped += 1;
+        if (!capped) skipped += 1;
         continue;
       }
       if (entry.isDirectory()) {
@@ -394,6 +422,9 @@ export function collectFiles(root: string, options: IndexOptions): CollectedFile
         continue;
       }
       if (!entry.isFile()) continue;
+      // Past the file cap the walk continues — but only to find tsconfig files.
+      if (TSCONFIG_NAME.test(entry.name)) configs.push(rel.split(sep).join('/'));
+      if (capped) continue;
       if (extraIgnore.has(rel) || extraIgnore.has(entry.name)) continue;
       const ext = posix.extname(entry.name).toLowerCase();
       const isManifest = entry.name === 'package.json';
@@ -414,18 +445,19 @@ export function collectFiles(root: string, options: IndexOptions): CollectedFile
   };
 
   walk(root);
-  return { files, skipped };
+  return { files, configs, skipped };
 }
 
 /** Shared context for the per-file indexing passes. */
 export interface IndexContext {
   relPaths: Set<string>;
-  aliasMap: AliasMap | null;
+  aliasMaps: AliasEntry[];
   /** Loaded tree-sitter grammars; null → regex extraction. */
   astEngine: AstEngine | null;
   packages: Map<string, PackageInfo>;
   pendingLinks: PendingLink[];
   defaultExports: Map<string, { line: number; text: string }>;
+  reexports: Map<string, FileReexports>;
   addNode: (node: ParsedNode) => void;
   addEdge: (src: string, dst: string, type: EdgeType, line: number | null) => void;
   upsertPackage: (name: string, patch: Partial<PackageInfo> & { dev?: boolean }) => PackageInfo;
@@ -438,6 +470,7 @@ interface ReferenceContext {
   exportedByFile: Map<string, ParsedNode[]>;
   symbolByLine: Map<string, ParsedNode>;
   defaultExports: Map<string, { line: number; text: string }>;
+  reexports: Map<string, FileReexports>;
   addNode: (node: ParsedNode) => void;
   addEdge: (src: string, dst: string, type: EdgeType, line: number | null) => void;
 }
@@ -464,6 +497,7 @@ function indexManifest(rel: string, source: string, ctx: IndexContext): void {
   }
 
   const selfName = typeof manifest.name === 'string' && manifest.name ? manifest.name : rel;
+  const exportsMap = parseExportsMap(manifest.exports);
   const self = upsertPackage(selfName, {
     version: typeof manifest.version === 'string' ? manifest.version : undefined,
     entry:
@@ -471,7 +505,9 @@ function indexManifest(rel: string, source: string, ctx: IndexContext): void {
         ? manifest.main
         : typeof manifest.module === 'string' && manifest.module
           ? manifest.module
-          : undefined,
+          : exportsMap?.get('.'),
+    exports: exportsMap ?? undefined,
+    imports: parseExportsMap(manifest.imports, '#') ?? undefined,
     external: false,
     manifests: new Set([rel]),
   });
@@ -492,6 +528,57 @@ function indexManifest(rel: string, source: string, ctx: IndexContext): void {
       void range;
     }
   }
+}
+
+/**
+ * Flatten a package.json `exports` field to a subpath → file map.
+ * Handles the string form, the subpath map, one level of condition objects
+ * (`import`/`default`/`require`/`types`…), and keeps `*` patterns verbatim.
+ */
+function parseExportsMap(value: unknown, prefix: '.' | '#' = '.'): Map<string, string> | null {
+  const targetOf = (v: unknown): string | null => {
+    if (typeof v === 'string') return v || null;
+    if (!v || typeof v !== 'object' || Array.isArray(v)) return null;
+    const rec = v as Record<string, unknown>;
+    // Conditions are evaluated in key order (Node semantics); we pretend to
+    // run an ESM/Node env and only fall back to other conditions when none
+    // of import/node/default resolve.
+    const passes = [new Set(['import', 'node', 'default']), new Set(['require', 'browser', 'types'])];
+    for (const active of passes) {
+      for (const [cond, target] of Object.entries(rec)) {
+        if (!active.has(cond)) continue;
+        const hit = targetOf(target);
+        if (hit) return hit;
+      }
+    }
+    for (const nested of Object.values(rec)) {
+      const hit = targetOf(nested);
+      if (hit) return hit;
+    }
+    return null;
+  };
+  if (!value) return null;
+  const keyed = (k: string): boolean => (prefix === '.' ? k === '.' || k.startsWith('./') : k.startsWith('#'));
+  if (typeof value === 'string') {
+    const target = targetOf(value);
+    return target ? new Map([[prefix, target]]) : null;
+  }
+  if (typeof value !== 'object' || Array.isArray(value)) return null;
+  const rec = value as Record<string, unknown>;
+  const keys = Object.keys(rec);
+  if (keys.length === 0) return null;
+  // A record without keyed entries is a single conditional target.
+  if (!keys.some(keyed)) {
+    const target = targetOf(value);
+    return target ? new Map([[prefix, target]]) : null;
+  }
+  const map = new Map<string, string>();
+  for (const [sub, v] of Object.entries(rec)) {
+    if (!keyed(sub)) continue;
+    const target = targetOf(v);
+    if (target) map.set(sub, target);
+  }
+  return map.size > 0 ? map : null;
 }
 
 /** File node + tags, then engine dispatch (AST when available, else regexes). */
@@ -544,7 +631,7 @@ function routeImport(
   payload: ImportPayload,
   ctx: IndexContext,
 ): void {
-  const { addEdge, upsertPackage, pendingLinks, aliasMap, relPaths, packages } = ctx;
+  const { addEdge, upsertPackage, pendingLinks, aliasMaps, relPaths, packages } = ctx;
   const fileKey = `file:${rel}`;
   const base = { fromKey: fileKey, fromPath: rel, target: spec, line, edge: 'imports' as const, ...payload };
 
@@ -553,10 +640,42 @@ function routeImport(
     return;
   }
 
-  // tsconfig `paths` alias → a workspace file, not a package.
-  const aliased = aliasMap ? resolveAlias(aliasMap, spec, relPaths) : null;
-  if (aliased) {
-    pendingLinks.push({ ...base, resolved: aliased });
+  // tsconfig `paths` alias → a workspace file, not a package. Nested project
+  // configs apply to the files under their directory; shallower maps are
+  // fallbacks (extended configs merge `paths`, but a superset is harmless).
+  for (const { dir, map } of aliasMaps) {
+    if (dir && !rel.startsWith(`${dir}/`)) continue;
+    const aliased = resolveAlias(map, spec, relPaths);
+    if (aliased) {
+      pendingLinks.push({ ...base, resolved: aliased });
+      return;
+    }
+  }
+
+  // package.json `imports` — `#`-specifiers resolve against the manifest of
+  // the package that owns the importing file (longest manifest-dir match).
+  if (spec.startsWith('#')) {
+    let owner: PackageInfo | undefined;
+    let ownerDir = '';
+    for (const info of packages.values()) {
+      for (const manifest of info.manifests) {
+        const dir = posix.dirname(manifest);
+        if (dir.length > ownerDir.length && (rel === dir || rel.startsWith(`${dir}/`))) {
+          owner = info;
+          ownerDir = dir;
+        }
+      }
+    }
+    if (owner) addEdge(fileKey, `package:${owner.name}`, 'depends_on', line);
+    if (!owner?.imports) return;
+    for (const target of patternTargets(owner.imports, spec)) {
+      if (!target.startsWith('.')) continue; // `#x` → bare package name: treat as external
+      const file = resolveFromRoot(`${ownerDir}/${target}`, relPaths);
+      if (file) {
+        pendingLinks.push({ ...base, resolved: file });
+        return;
+      }
+    }
     return;
   }
 
@@ -569,7 +688,15 @@ function routeImport(
     addEdge(fileKey, `package:${pkg}`, 'depends_on', line);
     const pkgDir = posix.dirname([...info.manifests][0] ?? rel);
     const sub = spec.slice(pkg.length).replace(/^[\/\\]+/, '');
-    const bases = sub ? [`${pkgDir}/${sub}`] : [info.entry ? `${pkgDir}/${info.entry}` : null, `${pkgDir}/index`];
+    const bases: (string | null)[] = [];
+    for (const exportTarget of resolveExportsTarget(info.exports, sub)) {
+      bases.push(`${pkgDir}/${exportTarget}`);
+    }
+    if (sub) {
+      bases.push(`${pkgDir}/${sub}`);
+    } else {
+      bases.push(info.entry ? `${pkgDir}/${info.entry}` : null, `${pkgDir}/index`);
+    }
     for (const b of bases) {
       if (!b) continue;
       const target = resolveFromRoot(b, relPaths);
@@ -584,18 +711,108 @@ function routeImport(
   addEdge(fileKey, `package:${pkg}`, 'depends_on', line);
 }
 
+/**
+ * Look up `./sub` (or `.`) in a package `exports` map. `*` patterns are tried
+ * most-specific first (longest prefix, then longest suffix) — Node's pattern
+ * ordering — and every matching target is returned so the caller can fall
+ * through when the best pattern maps to a file that isn't indexed.
+ */
+function resolveExportsTarget(exportsMap: Map<string, string> | undefined, sub: string): string[] {
+  return patternTargets(exportsMap, sub ? `./${sub}` : '.');
+}
+
+/**
+ * Match `key` against an exports/imports pattern map: exact keys first, then
+ * `*` patterns most-specific first. Returns every matching target so callers
+ * can fall through when the best pattern maps to a file that isn't indexed.
+ */
+function patternTargets(map: Map<string, string> | undefined, key: string): string[] {
+  if (!map) return [];
+  const direct = map.get(key);
+  if (direct) return [direct];
+  const matches: { prefix: number; suffix: number; target: string }[] = [];
+  for (const [pattern, target] of map) {
+    const star = pattern.indexOf('*');
+    if (star < 0 || !target.includes('*')) continue;
+    const prefix = pattern.slice(0, star);
+    const suffix = pattern.slice(star + 1);
+    if (!key.startsWith(prefix) || !key.endsWith(suffix) || key.length < prefix.length + suffix.length) {
+      continue;
+    }
+    const middle = key.slice(prefix.length, key.length - suffix.length);
+    matches.push({ prefix: prefix.length, suffix: suffix.length, target: target.replace(/\*/g, middle) });
+  }
+  matches.sort((a, b) => b.prefix - a.prefix || b.suffix - a.suffix);
+  return matches.map((m) => m.target);
+}
+
 /** AST extraction: parse-tree symbols and usage-based references. */
 function indexCodeFileAst(rel: string, parse: AstParse, ctx: IndexContext): void {
-  const { addNode, addEdge, pendingLinks, defaultExports } = ctx;
+  const { addNode, addEdge, pendingLinks, defaultExports, reexports } = ctx;
   const fileKey = `file:${rel}`;
   const ext = posix.extname(rel).toLowerCase();
   const seenSpecs = new Set<string>();
 
   for (const imp of parse.imports) {
+    if (imp.isReexport) {
+      // Record the re-export so importers of this file can follow the chain.
+      let re = reexports.get(rel);
+      if (!re) {
+        re = { named: new Map(), star: [] };
+        reexports.set(rel, re);
+      }
+      if (imp.exportAllLine !== null) {
+        if (imp.namespaceExport) {
+          // `export * as ns from './x'` — the file exports a module object
+          // named `ns`; members resolve through the namespace's spec.
+          re.named.set(imp.namespaceExport, { spec: imp.spec, imported: '*' });
+          const key = `symbol:${rel}#${imp.namespaceExport}`;
+          addNode({
+            key,
+            kind: 'symbol',
+            name: imp.namespaceExport,
+            path: rel,
+            line: imp.exportAllLine,
+            content: snippet(`export * as ${imp.namespaceExport} from '${imp.spec}'`, 300),
+            tags: ['symbol', 'exported', 'namespace'],
+            meta: { symbolKind: 'namespace', exported: true, language: ext.replace('.', '') },
+          });
+          addEdge(fileKey, key, 'defines', imp.exportAllLine);
+          addEdge(fileKey, key, 'exports', imp.exportAllLine);
+        } else {
+          re.star.push(imp.spec);
+        }
+      }
+      for (const binding of imp.named) {
+        re.named.set(binding.local, { spec: imp.spec, imported: binding.imported });
+      }
+    }
     const key = `${imp.spec}:${imp.line}`;
     if (seenSpecs.has(key)) continue;
     seenSpecs.add(key);
     routeImport(rel, imp.spec, imp.line, { ast: imp }, ctx);
+  }
+
+  // `export { x }` (no `from`) re-exports an imported binding — record it like
+  // `export { x } from '…'` so importers resolve through to the source, and
+  // cite the export line as usage of the original symbol.
+  for (const { exported, local, line } of parse.exportClauses) {
+    if (parse.symbols.some((s) => s.name === local)) continue; // declared here
+    for (const imp of parse.imports) {
+      if (imp.isReexport) continue;
+      const binding = imp.named.find((n) => n.local === local);
+      if (!binding) continue;
+      let re = reexports.get(rel);
+      if (!re) {
+        re = { named: new Map(), star: [] };
+        reexports.set(rel, re);
+      }
+      if (!re.named.has(exported)) {
+        re.named.set(exported, { spec: imp.spec, imported: binding.imported });
+      }
+      imp.named.push({ local: exported, imported: binding.imported, usedAtLine: line, props: new Map() });
+      break;
+    }
   }
 
   for (const sym of parse.symbols) {
@@ -622,7 +839,7 @@ function indexCodeFileAst(rel: string, parse: AstParse, ctx: IndexContext): void
 
 /** Regex extraction: comment-masked scans, import-clause-based references. */
 function indexCodeFileHeuristic(rel: string, source: string, ctx: IndexContext): void {
-  const { addNode, addEdge, upsertPackage, pendingLinks, aliasMap, relPaths, packages, defaultExports } = ctx;
+  const { addNode, addEdge, upsertPackage, pendingLinks, relPaths, packages, defaultExports } = ctx;
   const fileKey = `file:${rel}`;
   const ext = posix.extname(rel).toLowerCase();
 
@@ -655,10 +872,43 @@ function indexCodeFileHeuristic(rel: string, source: string, ctx: IndexContext):
       if (seenSpecs.has(key)) continue;
       seenSpecs.add(key);
 
+      const clauseText = clauseGroup > 0 ? (match[clauseGroup] ?? null) : null;
       const imports = parseImportedNames(
-        clauseGroup > 0 ? (match[clauseGroup] ?? null) : null,
+        clauseText,
         clauseGroup === 0 ? (lines[line - 1] ?? null) : null,
       );
+
+      if (/\bexport\b/.test(match[0]) && clauseText) {
+        // `export … from '…'` — record the re-export for barrel resolution.
+        let re = ctx.reexports.get(rel);
+        if (!re) {
+          re = { named: new Map(), star: [] };
+          ctx.reexports.set(rel, re);
+        }
+        for (const { exported, imported } of parseReexportClause(clauseText)) {
+          if (exported === '*') {
+            re.star.push(spec);
+          } else {
+            re.named.set(exported, { spec, imported });
+            if (imported === '*') {
+              // `export * as ns` — same namespace symbol the AST engine emits.
+              const key = `symbol:${rel}#${exported}`;
+              addNode({
+                key,
+                kind: 'symbol',
+                name: exported,
+                path: rel,
+                line,
+                content: snippet(`export * as ${exported} from '${spec}'`, 300),
+                tags: ['symbol', 'exported', 'namespace'],
+                meta: { symbolKind: 'namespace', exported: true, language: ext.replace('.', '') },
+              });
+              addEdge(fileKey, key, 'defines', line);
+              addEdge(fileKey, key, 'exports', line);
+            }
+          }
+        }
+      }
 
       routeImport(rel, spec, line, { imports }, ctx);
     }
@@ -729,6 +979,27 @@ function indexCodeFileHeuristic(rel: string, source: string, ctx: IndexContext):
     });
     addEdge(fileKey, symbolKey, 'defines', info.line);
     if (exported) addEdge(fileKey, symbolKey, 'exports', info.line);
+  }
+
+  // ---- `export { x }` (no `from`) re-exports an imported binding ----
+  const noFromRe = /(?:^|[^\w$])export\s+(?:type\s+)?\{([^}]*)\}(?!\s*from)/g;
+  let reexportMatch: RegExpExecArray | null;
+  while ((reexportMatch = noFromRe.exec(masked)) !== null) {
+    for (const part of (reexportMatch[1] ?? '').split(',')) {
+      const raw = part.trim().replace(/^type\s+/, '');
+      if (!raw) continue;
+      const [local, alias] = raw.split(/\s+as\s+/).map((s) => s.trim());
+      if (!local || localSymbols.has(local)) continue;
+      const exported = alias || local;
+      const link = pendingLinks.find((l) => l.fromPath === rel && (l.imports?.names ?? []).includes(local));
+      if (!link) continue;
+      let re = ctx.reexports.get(rel);
+      if (!re) {
+        re = { named: new Map(), star: [] };
+        ctx.reexports.set(rel, re);
+      }
+      if (!re.named.has(exported)) re.named.set(exported, { spec: link.target, imported: local });
+    }
   }
 }
 
@@ -839,6 +1110,45 @@ function resolveLink(link: PendingLink, headingKeys: Set<string>, refs: Referenc
 }
 
 /**
+ * Resolve the symbol an importer means by `name` in `rel`, following the
+ * file's own re-export chain when it declares no such symbol itself
+ * (`import { x } from './barrel'` → the file `export *`-ing `x`). `export *`
+ * fan-out is ambiguous when two star targets declare the same name — then
+ * the chain is abandoned rather than guessed.
+ */
+function resolveSymbolTarget(
+  rel: string,
+  name: string,
+  refs: ReferenceContext,
+  visited: Set<string> = new Set(),
+): string | null {
+  const direct = `symbol:${rel}#${name}`;
+  if (refs.nodes.has(direct)) return direct;
+  if (visited.has(direct)) return null;
+  visited.add(direct);
+  const re = refs.reexports.get(rel);
+  if (!re) return null;
+  const named = re.named.get(name);
+  if (named && named.imported !== '*') {
+    const target = resolveRelative(rel, named.spec, refs.relPaths);
+    if (target) {
+      const hit = resolveSymbolTarget(target, named.imported, refs, visited);
+      if (hit) return hit;
+    }
+  }
+  let found: string | null = null;
+  for (const spec of re.star) {
+    const target = resolveRelative(rel, spec, refs.relPaths);
+    if (!target) continue;
+    const hit = resolveSymbolTarget(target, name, refs, visited);
+    if (!hit) continue;
+    if (found) return null; // two star targets declare it — ambiguous
+    found = hit;
+  }
+  return found;
+}
+
+/**
  * Add `references` edges (importer file → exported symbol) for a resolved
  * module import: named imports, default imports, and namespace imports
  * (which reference every export of the target file).
@@ -848,8 +1158,8 @@ function addReferenceEdges(link: PendingLink, targetRel: string, refs: Reference
   if (!imports) return;
   if (imports.names.length > 0) {
     for (const name of imports.names) {
-      const key = `symbol:${targetRel}#${name}`;
-      if (refs.nodes.has(key)) refs.addEdge(link.fromKey, key, 'references', link.line);
+      const key = resolveSymbolTarget(targetRel, name, refs);
+      if (key) refs.addEdge(link.fromKey, key, 'references', link.line);
     }
   }
   if (imports.defaultImport) {
@@ -866,7 +1176,10 @@ function addReferenceEdges(link: PendingLink, targetRel: string, refs: Reference
 /**
  * Usage-based `references` edges from the AST engine: one edge per imported
  * symbol the file actually uses, cited at the first usage line (never at the
- * import line), plus `export *` re-exports referencing every export.
+ * import line), plus member-access references (`Ns.ExportedMember`). Bare
+ * `export *` re-exports carry no symbol name in their text, so they produce
+ * no references — barrel indirection is resolved through the target file's
+ * own re-export map instead.
  */
 function addAstReferenceEdges(
   ast: AstImport,
@@ -874,26 +1187,45 @@ function addAstReferenceEdges(
   targetRel: string,
   refs: ReferenceContext,
 ): void {
+  // Member accesses `Import.prop` resolve against the target's exports, then
+  // the file owning the binding's symbol (a member lives beside the symbol it
+  // is a member of — `import {T} from barrel; T.member`), and finally the
+  // source module when the binding names a re-exported namespace.
+  const addProps = (props: Map<string, number>, imported?: string, homeRel?: string): void => {
+    for (const [prop, line] of props) {
+      let key = resolveSymbolTarget(targetRel, prop, refs);
+      if (!key && homeRel && homeRel !== targetRel) {
+        key = resolveSymbolTarget(homeRel, prop, refs);
+      }
+      if (!key && imported) {
+        const ns = refs.reexports.get(targetRel)?.named.get(imported);
+        if (ns && ns.imported === '*') {
+          const target = resolveRelative(targetRel, ns.spec, refs.relPaths);
+          if (target) key = resolveSymbolTarget(target, prop, refs);
+        }
+      }
+      if (key) refs.addEdge(fromKey, key, 'references', line);
+    }
+  };
   for (const binding of ast.named) {
-    if (binding.usedAtLine === null) continue; // imported but never used
-    const key = `symbol:${targetRel}#${binding.imported}`;
-    if (refs.nodes.has(key)) refs.addEdge(fromKey, key, 'references', binding.usedAtLine);
+    // The import clause itself is a rename-sensitive mention of the name, so
+    // an imported-but-unused binding cites the import line.
+    const line = binding.usedAtLine ?? ast.line;
+    const key = resolveSymbolTarget(targetRel, binding.imported, refs);
+    if (key) refs.addEdge(fromKey, key, 'references', line);
+    if (binding.local !== binding.imported) {
+      const aliasKey = resolveSymbolTarget(targetRel, binding.local, refs);
+      if (aliasKey && aliasKey !== key) refs.addEdge(fromKey, aliasKey, 'references', line);
+    }
+    const homeRel = key ? key.slice('symbol:'.length, key.indexOf('#')) : undefined;
+    addProps(binding.props, binding.imported, homeRel);
   }
-  if (ast.defaultLocal && ast.defaultLocal.usedAtLine !== null) {
+  if (ast.defaultLocal) {
     const symbol = defaultExportSymbol(targetRel, refs);
-    if (symbol) refs.addEdge(fromKey, symbol.key, 'references', ast.defaultLocal.usedAtLine);
+    if (symbol) refs.addEdge(fromKey, symbol.key, 'references', ast.defaultLocal.usedAtLine ?? ast.line);
+    addProps(ast.defaultLocal.props);
   }
-  if (ast.exportAllLine !== null) {
-    for (const symbol of refs.exportedByFile.get(targetRel) ?? []) {
-      refs.addEdge(fromKey, symbol.key, 'references', ast.exportAllLine);
-    }
-  }
-  if (ast.namespaceLocal) {
-    for (const [prop, line] of ast.namespaceLocal.props) {
-      const key = `symbol:${targetRel}#${prop}`;
-      if (refs.nodes.has(key)) refs.addEdge(fromKey, key, 'references', line);
-    }
-  }
+  if (ast.namespaceLocal) addProps(ast.namespaceLocal.props);
 }
 
 /**
@@ -952,6 +1284,33 @@ export function parseImportedNames(
   return result;
 }
 
+/**
+ * Re-export clause (`{ a, b as c }`, `*`, `* as ns` before `from`) → pairs of
+ * re-exported name and the name it has in the source module; `*` for star.
+ */
+function parseReexportClause(clause: string): { exported: string; imported: string }[] {
+  const text = clause.replace(/\s+from\s*$/, '').trim();
+  const out: { exported: string; imported: string }[] = [];
+  const braces = /\{([^}]*)\}/.exec(text);
+  if (braces?.[1] !== undefined) {
+    for (const part of braces[1].split(',')) {
+      const raw = part.trim().replace(/^type\s+/, '');
+      if (!raw) continue;
+      const [name, alias] = raw.split(/\s+as\s+/).map((s) => s.trim());
+      if (name && /^[\p{L}_$][\p{L}\p{N}_$]*$/u.test(name)) {
+        out.push({ exported: alias && /^[\p{L}_$][\p{L}\p{N}_$]*$/u.test(alias) ? alias : name, imported: name });
+      }
+    }
+    return out;
+  }
+  if (text.startsWith('*')) {
+    const ns = /^\*\s+as\s+([\p{L}_$][\p{L}\p{N}_$]*)\s*$/u.exec(text);
+    if (ns) out.push({ exported: ns[1] as string, imported: '*' });
+    else out.push({ exported: '*', imported: '*' });
+  }
+  return out;
+}
+
 function applyClauseText(text: string, result: ImportedNames): void {
   const braces = /\{([^}]*)\}/.exec(text);
   if (braces?.[1] !== undefined) {
@@ -983,10 +1342,11 @@ function candidatesFor(base: string): string[] {
   if (/\.d\.ts$/.test(base)) {
     push(base.replace(/\.d\.ts$/, '.ts'));
   }
-  if (!posix.extname(base)) {
-    for (const ext of ['.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs', '.md', '.mdx', '.json']) {
-      push(`${base}${ext}`);
-    }
+  // Append extensions even when the base looks dotted (`./foo.view` →
+  // `foo.view.tsx`): TypeScript resolves extensionless specs segment-wise, so
+  // a `.view`/`.shared` filename segment must not block the search.
+  for (const ext of ['.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs', '.md', '.mdx', '.json']) {
+    push(`${base}${ext}`);
   }
   for (const ext of ['.ts', '.tsx', '.js', '.jsx', '.md']) {
     push(`${base}/index${ext}`);
@@ -1033,16 +1393,21 @@ export interface AliasMap {
   patterns: { pattern: string; subs: string[] }[];
 }
 
+/** A paths map and the workspace-relative directory it applies under. */
+export interface AliasEntry {
+  /** '' means the workspace root — applies to every file. */
+  dir: string;
+  map: AliasMap;
+}
+
 /**
- * Read `baseUrl` and `paths` from the root tsconfig/jsconfig, following the
+ * Read `baseUrl` and `paths` from one tsconfig/jsconfig file, following the
  * `extends` chain (local files only; node_modules extends are ignored).
  * Returns null when no usable `paths` mapping exists.
  */
-export function loadAliasMap(root: string): AliasMap | null {
+function loadAliasMapAt(root: string, configPath: string): AliasEntry | null {
   const configs: { dir: string; compilerOptions: Record<string, unknown> }[] = [];
   const seen = new Set<string>();
-  let configPath = join(root, 'tsconfig.json');
-  if (!existsSync(configPath)) configPath = join(root, 'jsconfig.json');
   while (existsSync(configPath) && !seen.has(configPath) && configs.length < 6) {
     seen.add(configPath);
     const parsed = parseJsonc(readFileSafe(configPath) ?? '');
@@ -1055,16 +1420,18 @@ export function loadAliasMap(root: string): AliasMap | null {
     configPath = resolve(dir, ext.endsWith('.json') ? ext : `${ext}.json`);
   }
   if (configs.length === 0) return null;
+  const configDir = toPosix(relative(root, dirname(seen.values().next().value as string)));
 
-  // Apply from the outermost ancestor down so nearer configs override.
-  let baseUrl = '.';
+  // Apply from the outermost ancestor down so nearer configs override. Each
+  // `baseUrl` resolves against the config that declares it; without one,
+  // `paths` substitutes relative to the config that declares them (TS 4.1+).
+  let baseUrlAbs: string | null = null;
   let paths: Record<string, string[]> | null = null;
+  let pathsDir: string | null = null;
   for (let i = configs.length - 1; i >= 0; i -= 1) {
     const { dir, compilerOptions } = configs[i]!;
     if (typeof compilerOptions.baseUrl === 'string' && compilerOptions.baseUrl) {
-      const resolved = resolve(dir, compilerOptions.baseUrl);
-      baseUrl = relative(root, resolved);
-      if (baseUrl.startsWith('..')) return null; // baseUrl outside the workspace
+      baseUrlAbs = resolve(dir, compilerOptions.baseUrl);
     }
     if (compilerOptions.paths && typeof compilerOptions.paths === 'object') {
       const map: Record<string, string[]> = {};
@@ -1074,14 +1441,45 @@ export function loadAliasMap(root: string): AliasMap | null {
         }
       }
       paths = map;
+      pathsDir = dir;
     }
   }
-  if (!paths || Object.keys(paths).length === 0) return null;
-  const normalizedBase = toPosix(baseUrl).replace(/^\.\//, '').replace(/\/+$/, '');
+  if (!paths || !pathsDir || Object.keys(paths).length === 0) return null;
+  const baseUrl = toPosix(relative(root, baseUrlAbs ?? pathsDir));
+  if (baseUrl.startsWith('..')) return null; // baseUrl outside the workspace
   return {
-    baseUrl: normalizedBase === '.' ? '' : normalizedBase,
-    patterns: Object.entries(paths).map(([pattern, subs]) => ({ pattern, subs })),
+    dir: configDir === '.' ? '' : configDir,
+    map: {
+      baseUrl: baseUrl === '.' ? '' : baseUrl.replace(/\/+$/, ''),
+      patterns: Object.entries(paths).map(([pattern, subs]) => ({ pattern, subs })),
+    },
   };
+}
+
+/**
+ * Collect `paths` maps from every tsconfig/jsconfig in the workspace, deepest
+ * config directories first so a package's own aliases win over root ones.
+ */
+export function loadAliasMaps(root: string, configRels: string[]): AliasEntry[] {
+  const out: AliasEntry[] = [];
+  for (const rel of configRels) {
+    const entry = loadAliasMapAt(root, join(root, rel));
+    if (entry) out.push(entry);
+  }
+  const depth = (dir: string) => (dir === '' ? 0 : dir.split('/').length);
+  out.sort((a, b) => depth(b.dir) - depth(a.dir));
+  return out;
+}
+
+/**
+ * Read `baseUrl` and `paths` from the root tsconfig/jsconfig.
+ * Returns null when no usable `paths` mapping exists.
+ */
+export function loadAliasMap(root: string): AliasMap | null {
+  const ts = loadAliasMapAt(root, join(root, 'tsconfig.json'));
+  if (ts) return ts.map;
+  const js = loadAliasMapAt(root, join(root, 'jsconfig.json'));
+  return js ? js.map : null;
 }
 
 /** Resolve a bare specifier through a paths mapping, or null. */

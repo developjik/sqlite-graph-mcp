@@ -39,6 +39,7 @@ const VALUE_FLAGS = new Set([
   'start',
   'path',
   'tag',
+  'max-files',
 ]);
 
 export function parseArgs(argv: string[]): ParsedArgs {
@@ -146,6 +147,7 @@ async function main(argv: string[]): Promise<number> {
           '  --type <edge>         imports|exports|defines|links_to|depends_on|references',
           '  --dir out|in|both     Walk direction (default: out)',
           '  --depth <n>           Walk depth (default: 6)',
+          '  --max-files <n>       index: hard cap on indexed files (default 5000)',
           '  --check               diff: exit 3 when a breaking change is found',
           '  --json                Machine-readable output',
           '',
@@ -183,6 +185,7 @@ async function main(argv: string[]): Promise<number> {
         dbPath: dbPathFor(target, flags),
         ignore: typeof flags.ignore === 'string' ? flags.ignore.split(',') : undefined,
         engine: flags.engine === 'heuristic' ? 'heuristic' : undefined,
+        maxFiles: typeof flags['max-files'] === 'string' ? Number(flags['max-files']) : undefined,
       });
       if (json) {
         process.stdout.write(`${JSON.stringify(stats, null, 2)}\n`);

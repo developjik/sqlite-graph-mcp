@@ -1,0 +1,16 @@
+{
+  "name": "refs-pkg2",
+  "private": true,
+  "exports": {
+    ".": "./src/index.ts",
+    "./*": "./src/components/*.tsx",
+    "./ctx/*": "./src/context/*.ts"
+  },
+  "imports": {
+    "#priv": {
+      "bun": "./src/priv.bun.ts",
+      "node": "./src/priv.node.ts",
+      "default": "./src/priv.bun.ts"
+    }
+  }
+}

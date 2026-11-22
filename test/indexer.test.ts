@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { collectFiles, indexWorkspace, maskComments, resolveRelative, slugify } from '../src/indexer.js';
 import { findNodes, walkNodes } from '../src/query.js';
-import { createFixtureGraph, fixtureRoot, idsOfKeys, keySet, monoRoot, tempDir } from './helpers.js';
+import { createFixtureGraph, fixtureRoot, idsOfKeys, keySet, monoRoot, refsRoot, tempDir } from './helpers.js';
 
 const graphs: { cleanup: () => void }[] = [];
 afterEach(() => {
@@ -263,19 +263,20 @@ describe('mono workspace: aliases, workspace packages, default imports', () => {
     expect(exported.c).toBe(1);
   });
 
-  it('omits references for unused imports and tracks namespace members', async () => {
+  it('cites unused imports at the import line and tracks namespace members', async () => {
     const graph = await createFixtureGraph({ root: monoRoot });
     graphs.push(graph);
 
-    // unused.ts imports greet but never uses it: no reference, only imports.
+    // unused.ts imports greet but never uses it: the import clause is still a
+    // rename-sensitive mention, so the edge cites the import line.
     const unusedRefs = graph.store.db
       .prepare(
-        `SELECT COUNT(*) AS c FROM edges e
+        `SELECT d.key AS dst, e.line FROM edges e
          JOIN nodes s ON s.id = e.src JOIN nodes d ON d.id = e.dst
          WHERE e.type = 'references' AND s.key = 'file:src/unused.ts'`,
       )
-      .get() as { c: number };
-    expect(unusedRefs.c).toBe(0);
+      .all() as { dst: string; line: number }[];
+    expect(unusedRefs).toEqual([{ dst: 'symbol:src/greet.ts#greet', line: 1 }]);
     const unusedImports = graph.store.db
       .prepare(
         `SELECT COUNT(*) AS c FROM edges e
@@ -295,6 +296,212 @@ describe('mono workspace: aliases, workspace packages, default imports', () => {
       )
       .all() as { dst: string; line: number }[];
     expect(nsRefs).toEqual([{ dst: 'symbol:packages/local-lib/src/entry.ts#libHelper', line: 3 }]);
+  });
+});
+
+describe('refs fixture: type usage, barrels, package exports', () => {
+  function refsFrom(store: { db: import('../src/db.js').GraphStore['db'] }, srcKey: string): string[] {
+    const rows = store.db
+      .prepare(
+        `SELECT d.key AS dst FROM edges e
+         JOIN nodes s ON s.id = e.src JOIN nodes d ON d.id = e.dst
+         WHERE e.type = 'references' AND s.key = ? ORDER BY d.key`,
+      )
+      .all(srcKey) as { dst: string }[];
+    return rows.map((row) => row.dst);
+  }
+
+  it('counts type-position usage: annotations, generics, extends, implements, as', async () => {
+    const graph = await createFixtureGraph({ root: refsRoot });
+    graphs.push(graph);
+
+    const targets = refsFrom(graph.store, 'file:src/typeuse.ts');
+    // `import type { T1 }` used only in type positions still references it.
+    expect(targets).toContain('symbol:src/types.ts#T1');
+    // Inline `{ type T2 }` specifier + `Promise<T2>`/`extends T1`/`implements` positions.
+    expect(targets).toContain('symbol:src/types2.ts#T2');
+    expect(targets).toContain('symbol:src/types2.ts#val');
+  });
+
+  it('resolves package.json exports (entry and subpaths)', async () => {
+    const graph = await createFixtureGraph({ root: refsRoot });
+    graphs.push(graph);
+
+    const imports = graph.store.db
+      .prepare(
+        `SELECT d.key AS dst FROM edges e
+         JOIN nodes s ON s.id = e.src JOIN nodes d ON d.id = e.dst
+         WHERE e.type = 'imports' AND s.key = 'file:src/app.ts' ORDER BY d.key`,
+      )
+      .all() as { dst: string }[];
+    const targets = imports.map((row) => row.dst);
+    expect(targets).toContain('file:pkg/src/index.ts'); // 'refs-pkg' → exports['.']
+    expect(targets).toContain('file:pkg/src/sub.ts'); // 'refs-pkg/sub' → exports['./sub']
+
+    const refs = refsFrom(graph.store, 'file:src/app.ts');
+    // `coreFn`/`CoreType` are declared behind the barrel, not in index.ts.
+    expect(refs).toContain('symbol:pkg/src/core.ts#coreFn');
+    expect(refs).toContain('symbol:pkg/src/core.ts#CoreType');
+    expect(refs).toContain('symbol:pkg/src/sub.ts#deepOnly');
+  });
+
+  it('follows export * barrels without citing the barrel itself', async () => {
+    const graph = await createFixtureGraph({ root: refsRoot });
+    graphs.push(graph);
+
+    const refs = refsFrom(graph.store, 'file:src/consumer.ts');
+    expect(refs).toContain('symbol:src/impl.ts#viaBarrel');
+    // No phantom `symbol:src/barrel.ts#viaBarrel` node was invented.
+    expect(graph.store.nodeByKey('symbol:src/barrel.ts#viaBarrel')).toBeNull();
+  });
+
+  it('emits no references from export * (text carries no symbol name)', async () => {
+    const graph = await createFixtureGraph({ root: refsRoot });
+    graphs.push(graph);
+
+    // barrel.ts is a pure `export *` — it keeps the file-level imports edge…
+    expect(refsFrom(graph.store, 'file:src/barrel.ts')).toEqual([]);
+    const imports = graph.store.db
+      .prepare(
+        `SELECT COUNT(*) AS c FROM edges e
+         JOIN nodes s ON s.id = e.src JOIN nodes d ON d.id = e.dst
+         WHERE e.type = 'imports' AND s.key = 'file:src/barrel.ts' AND d.key = 'file:src/impl.ts'`,
+      )
+      .get() as { c: number };
+    expect(imports.c).toBe(1);
+
+    // …but a named re-export `export { x } from` is textual usage → references.
+    const namedRefs = refsFrom(graph.store, 'file:src/namedbarrel.ts');
+    expect(namedRefs).toContain('symbol:src/impl.ts#viaBarrel');
+  });
+
+  it('counts shorthand, computed-adjacent and dynamic-import destructuring', async () => {
+    const graph = await createFixtureGraph({ root: refsRoot });
+    graphs.push(graph);
+
+    // `{ helperA }` object shorthand + call usage.
+    const shortRefs = refsFrom(graph.store, 'file:src/shorthand.ts');
+    expect(shortRefs).toContain('symbol:src/helpers.ts#helperA');
+    expect(shortRefs).toContain('symbol:src/helpers.ts#helperB');
+
+    // `const { dynFn } = await import('./dynmod')` → imports + usage reference.
+    const dynImports = graph.store.db
+      .prepare(
+        `SELECT COUNT(*) AS c FROM edges e
+         JOIN nodes s ON s.id = e.src JOIN nodes d ON d.id = e.dst
+         WHERE e.type = 'imports' AND s.key = 'file:src/dynimp.ts' AND d.key = 'file:src/dynmod.ts'`,
+      )
+      .get() as { c: number };
+    expect(dynImports.c).toBe(1);
+    const dynRefs = refsFrom(graph.store, 'file:src/dynimp.ts');
+    expect(dynRefs).toContain('symbol:src/dynmod.ts#dynFn');
+    // `() => import('./dynmod')` binds nothing — no phantom default-export ref.
+    expect(dynRefs).not.toContain('symbol:src/dynmod.ts#default');
+  });
+
+  it('references members reached through a binding (`Wrap.Inner`)', async () => {
+    const graph = await createFixtureGraph({ root: refsRoot });
+    graphs.push(graph);
+
+    const refs = refsFrom(graph.store, 'file:src/nsprop.ts');
+    expect(refs).toContain('symbol:src/wrapmod.ts#Wrap');
+    expect(refs).toContain('symbol:src/wrapmod.ts#Inner');
+  });
+
+  it('keeps the same barrel and export-* behavior under the heuristic engine', async () => {
+    const graph = await createFixtureGraph({ root: refsRoot, engine: 'heuristic' });
+    graphs.push(graph);
+    expect(graph.stats.engine).toBe('heuristic');
+
+    expect(refsFrom(graph.store, 'file:src/consumer.ts')).toContain('symbol:src/impl.ts#viaBarrel');
+    expect(refsFrom(graph.store, 'file:src/barrel.ts')).toEqual([]);
+    expect(refsFrom(graph.store, 'file:src/app.ts')).toContain('symbol:pkg/src/core.ts#coreFn');
+  });
+
+  it('resolves export * as ns: namespace symbol plus member references', async () => {
+    const graph = await createFixtureGraph({ root: refsRoot });
+    graphs.push(graph);
+
+    // The barrel exports a real namespace name importers can bind.
+    const ns = graph.store.nodeByKey('symbol:src/nsbarrel.ts#Ns');
+    expect(ns?.tags).toContain('exported');
+
+    const refs = refsFrom(graph.store, 'file:src/nsuser.ts');
+    expect(refs).toContain('symbol:src/nsbarrel.ts#Ns'); // `Ns` binding
+    expect(refs).toContain('symbol:src/nsmod.ts#inner'); // `Ns.inner`
+    expect(refs).toContain('symbol:src/nsmod.ts#InnerError'); // `Ns.InnerError`
+  });
+
+  it('resolves nested tsconfig paths aliases (@/*) to package files', async () => {
+    const graph = await createFixtureGraph({ root: refsRoot });
+    graphs.push(graph);
+
+    const imports = graph.store.db
+      .prepare(
+        `SELECT d.key AS dst FROM edges e
+         JOIN nodes s ON s.id = e.src JOIN nodes d ON d.id = e.dst
+         WHERE e.type = 'imports' AND s.key = 'file:pkga/src/usealias.ts' ORDER BY d.key`,
+      )
+      .all() as { dst: string }[];
+    expect(imports.map((row) => row.dst)).toContain('file:pkga/src/aliased.ts'); // '@/aliased'
+
+    const refs = refsFrom(graph.store, 'file:pkga/src/usealias.ts');
+    expect(refs).toContain('symbol:pkga/src/aliased.ts#aliased');
+    // `second` is imported but unused — the import line is cited.
+    expect(refs).toContain('symbol:pkga/src/aliased.ts#second');
+  });
+
+  it('keeps export * as ns parity under the heuristic engine', async () => {
+    const graph = await createFixtureGraph({ root: refsRoot, engine: 'heuristic' });
+    graphs.push(graph);
+    expect(graph.stats.engine).toBe('heuristic');
+
+    expect(graph.store.nodeByKey('symbol:src/nsbarrel.ts#Ns')?.tags).toContain('exported');
+    expect(refsFrom(graph.store, 'file:src/nsuser.ts')).toContain('symbol:src/nsbarrel.ts#Ns');
+    expect(refsFrom(graph.store, 'file:pkga/src/usealias.ts')).toContain('symbol:pkga/src/aliased.ts#aliased');
+  });
+
+  it('resolves extensionless specs whose basename contains dots (./foo.view)', async () => {
+    const graph = await createFixtureGraph({ root: refsRoot });
+    graphs.push(graph);
+
+    const imports = graph.store.db
+      .prepare(
+        `SELECT COUNT(*) AS c FROM edges e
+         JOIN nodes s ON s.id = e.src JOIN nodes d ON d.id = e.dst
+         WHERE e.type = 'imports' AND s.key = 'file:src/dotimp.ts' AND d.key = 'file:src/foo.view.ts'`,
+      )
+      .get() as { c: number };
+    expect(imports.c).toBe(1);
+    expect(refsFrom(graph.store, 'file:src/dotimp.ts')).toContain('symbol:src/foo.view.ts#viewFn');
+  });
+
+  it('orders exports wildcards by specificity and falls through misses', async () => {
+    const graph = await createFixtureGraph({ root: refsRoot });
+    graphs.push(graph);
+
+    // './*' → './src/components/*.tsx' appears first but loses to './ctx/*'
+    // (longer prefix) — and even its miss falls through to the better match.
+    const refs = refsFrom(graph.store, 'file:src/ctxuse.ts');
+    expect(refs).toContain('symbol:pkg2/src/context/thing.ts#thing');
+  });
+
+  it('resolves package.json imports (#-specifiers) to the node condition', async () => {
+    const graph = await createFixtureGraph({ root: refsRoot });
+    graphs.push(graph);
+
+    const imports = graph.store.db
+      .prepare(
+        `SELECT d.key AS dst FROM edges e
+         JOIN nodes s ON s.id = e.src JOIN nodes d ON d.id = e.dst
+         WHERE e.type = 'imports' AND s.key = 'file:pkg2/src/user.ts'`,
+      )
+      .all() as { dst: string }[];
+    expect(imports.map((row) => row.dst)).toContain('file:pkg2/src/priv.node.ts');
+
+    const refs = refsFrom(graph.store, 'file:pkg2/src/user.ts');
+    expect(refs).toContain('symbol:pkg2/src/priv.node.ts#privVal');
+    expect(refs).not.toContain('symbol:pkg2/src/priv.bun.ts#privVal');
   });
 });
 
