@@ -1,0 +1,9 @@
+{
+  "name": "refs-pkg",
+  "private": true,
+  "exports": {
+    ".": "./src/index.ts",
+    "./sub": "./src/sub.ts",
+    "./*": "./src/*.ts"
+  }
+}

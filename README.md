@@ -47,7 +47,7 @@ it", the claim comes with a path and a line number.
 | `defines` | file → symbol, file → heading, `package.json` → its package |
 | `links_to` | Markdown link/reference → file or heading, including `#anchors` |
 | `depends_on` | file → package, package → dependency from the manifest |
-| `references` | file → symbol: the file actually uses that symbol (named/default/namespace/`require` bindings; unused imports produce no edge) |
+| `references` | file → symbol: the file actually uses that symbol (named/default/namespace/`require` bindings; an imported-but-unused binding cites the import line) |
 
 Files are tagged (`code`, `ts`, `doc`, `test`, `entry`, `manifest`, `exported`, …), and tags are
 filterable — that is how `graph_orphans` can skip test and entry files without extra arguments.
@@ -58,7 +58,8 @@ The default **`ast` engine** parses TypeScript/TSX (and plain JS) with
 tree-sitter WASM grammars vendored in the package — no native build, no
 network. Imports, symbols and exports come from the parse tree, and
 `references` edges cite the first line where an imported binding is actually
-used. If the WASM files cannot load, indexing falls back to the
+used; an imported-but-unused binding cites the import line, because the clause
+itself is a rename-sensitive mention. If the WASM files cannot load, indexing falls back to the
 **`heuristic` engine** (comment-masked regexes, import-clause-based
 references). Force it explicitly with `graph_index { engine: "heuristic" }` or
 `--engine heuristic`; the index report says which engine ran (`engine: "ast"`).
@@ -392,7 +393,7 @@ test/             fixtures, unit tests, stdio MCP protocol tests
 
 The test suite covers indexer counts and idempotency, extension remapping (`.js` import →
 `.ts` source), usage-based `references` (alias/default/namespace bindings, unused imports
-produce no edge, synthetic default exports), both engines, tsconfig `paths` aliases and
+cited at the import line, synthetic default exports), both engines, tsconfig `paths` aliases and
 workspace-local packages (see `test/fixtures/mono`), schema-version migration, cycle-safe
 traversal, every operator, the plan DSL, orphan detection, the CLI, and the MCP handshake
 both through the official SDK client and as raw newline-delimited JSON-RPC. Refresh the

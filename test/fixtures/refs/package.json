@@ -1,0 +1,7 @@
+{
+  "name": "refs-root",
+  "private": true,
+  "dependencies": {
+    "refs-pkg": "*"
+  }
+}

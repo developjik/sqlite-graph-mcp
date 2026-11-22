@@ -39,6 +39,7 @@ const VALUE_FLAGS = new Set([
   'start',
   'path',
   'tag',
+  'max-files',
 ]);
 
 export function parseArgs(argv: string[]): ParsedArgs {
@@ -114,49 +115,61 @@ function printNodes(
   }
 }
 
+function printHelp(): void {
+  process.stdout.write(
+    [
+      `${SERVER_NAME} v${SERVER_VERSION} — zero-embedding code & spec graph over SQLite`,
+      '',
+      'Usage: sqlite-graph-mcp [command] [options]',
+      '',
+      'Commands:',
+      '  serve                 Start the MCP stdio server (default)',
+      '  index [dir]           Build or rebuild .sqlite-graph/index.db',
+      '  find <query>          Operator 1: text search (FTS5 + substring)',
+      '  walk <ref...>         Operator 2: recursive-CTE traversal',
+      '  plan <plan>           Operator 5: chained find|walk|filter|minus answer',
+      '  diff <base> <head>     Graph diff between two git revs or directories',
+      '  orphans               Files with no inbound imports/links, unexported symbols',
+      '',
+      'Options:',
+      '  --root <dir>          Workspace root (default: current directory)',
+      '  --db <path>           Database file (default: <root>/.sqlite-graph/index.db)',
+      '  --kind <kind>         file|symbol|heading|package (comma separated)',
+      '  --limit <n>           Result cap',
+      '  --type <edge>         imports|exports|defines|links_to|depends_on|references',
+      '  --dir out|in|both     Walk direction (default: out)',
+      '  --depth <n>           Walk depth (default: 6)',
+      '  --max-files <n>       index: hard cap on indexed files (default 5000)',
+      '  --check               diff: exit 3 when a breaking change is found',
+      '  --json                Machine-readable output',
+      '',
+      'Examples:',
+      '  npx @developjik/sqlite-graph-mcp index',
+      '  npx @developjik/sqlite-graph-mcp find "walkNodes" --kind symbol',
+      '  npx @developjik/sqlite-graph-mcp walk 42 --type imports --depth 3',
+      '  npx @developjik/sqlite-graph-mcp plan \'find "graph" kind=symbol | walk type=references dir=in\'',
+      '',
+    ].join('\n'),
+  );
+}
+
 async function main(argv: string[]): Promise<number> {
   const { command, positional, flags } = parseArgs(argv);
   const root = resolve(typeof flags.root === 'string' ? flags.root : process.cwd());
   const json = flags.json === true;
 
+  // `index --help` and friends: a trailing --help prints usage instead of
+  // being swallowed as a flag and running the command.
+  if (flags.help === true) {
+    printHelp();
+    return 0;
+  }
+
   switch (command) {
     case 'help':
     case '--help':
     case '-h': {
-      process.stdout.write(
-        [
-          `${SERVER_NAME} v${SERVER_VERSION} — zero-embedding code & spec graph over SQLite`,
-          '',
-          'Usage: sqlite-graph-mcp [command] [options]',
-          '',
-          'Commands:',
-          '  serve                 Start the MCP stdio server (default)',
-          '  index [dir]           Build or rebuild .sqlite-graph/index.db',
-          '  find <query>          Operator 1: text search (FTS5 + substring)',
-          '  walk <ref...>         Operator 2: recursive-CTE traversal',
-          '  plan <plan>           Operator 5: chained find|walk|filter|minus answer',
-          '  diff <base> <head>     Graph diff between two git revs or directories',
-          '  orphans               Files with no inbound imports/links, unexported symbols',
-          '',
-          'Options:',
-          '  --root <dir>          Workspace root (default: current directory)',
-          '  --db <path>           Database file (default: <root>/.sqlite-graph/index.db)',
-          '  --kind <kind>         file|symbol|heading|package (comma separated)',
-          '  --limit <n>           Result cap',
-          '  --type <edge>         imports|exports|defines|links_to|depends_on|references',
-          '  --dir out|in|both     Walk direction (default: out)',
-          '  --depth <n>           Walk depth (default: 6)',
-          '  --check               diff: exit 3 when a breaking change is found',
-          '  --json                Machine-readable output',
-          '',
-          'Examples:',
-          '  npx @developjik/sqlite-graph-mcp index',
-          '  npx @developjik/sqlite-graph-mcp find "walkNodes" --kind symbol',
-          '  npx @developjik/sqlite-graph-mcp walk 42 --type imports --depth 3',
-          '  npx @developjik/sqlite-graph-mcp plan \'find "graph" kind=symbol | walk type=references dir=in\'',
-          '',
-        ].join('\n'),
-      );
+      printHelp();
       return 0;
     }
     case 'version':
@@ -178,11 +191,23 @@ async function main(argv: string[]): Promise<number> {
     }
     case 'index': {
       const target = positional[0] ? resolve(positional[0]) : root;
+      const rawMax = flags['max-files'];
+      let maxFiles: number | undefined;
+      if (rawMax !== undefined) {
+        const parsed = rawMax === true ? NaN : Number(rawMax);
+        if (!Number.isInteger(parsed) || parsed < 1) {
+          throw new Error(
+            `--max-files must be a positive integer, got ${rawMax === true ? 'no value' : `'${rawMax}'`}`,
+          );
+        }
+        maxFiles = parsed;
+      }
       const stats = await indexWorkspace({
         root: target,
         dbPath: dbPathFor(target, flags),
         ignore: typeof flags.ignore === 'string' ? flags.ignore.split(',') : undefined,
         engine: flags.engine === 'heuristic' ? 'heuristic' : undefined,
+        maxFiles,
       });
       if (json) {
         process.stdout.write(`${JSON.stringify(stats, null, 2)}\n`);
@@ -191,7 +216,10 @@ async function main(argv: string[]): Promise<number> {
         process.stdout.write(
           `Indexed ${stats.files} files in ${stats.durationMs}ms (${stats.engine} engine) → ${stats.dbPath}\n` +
             `  nodes: ${nodes.total} (file ${nodes.file}, symbol ${nodes.symbol}, heading ${nodes.heading}, package ${nodes.package})\n` +
-            `  edges: ${edges.total} (imports ${edges.imports}, exports ${edges.exports}, defines ${edges.defines}, links_to ${edges.links_to}, depends_on ${edges.depends_on}, references ${edges.references})\n`,
+            `  edges: ${edges.total} (imports ${edges.imports}, exports ${edges.exports}, defines ${edges.defines}, links_to ${edges.links_to}, depends_on ${edges.depends_on}, references ${edges.references})\n` +
+            (stats.cappedFiles > 0
+              ? `  (file cap reached: ${stats.cappedFiles} more files skipped — pass --max-files <n> to index them)\n`
+              : ''),
         );
       }
       return 0;
@@ -236,7 +264,7 @@ async function main(argv: string[]): Promise<number> {
           json,
           'Walked',
         );
-        return 0;
+        return walked.nodes.length > 0 ? 0 : 1;
       } finally {
         store.close();
       }
