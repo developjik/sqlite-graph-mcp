@@ -22,7 +22,8 @@ jobs:
       - name: Check versions and extract release notes
         run: node scripts/check-version-sync.mjs --tag "$GITHUB_REF_NAME" --notes-out "$RUNNER_TEMP/notes.md"
       - name: Append changelog link
-        run: printf '\nFull changelog: %s/%s/blob/main/CHANGELOG.md\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" >> "$RUNNER_TEMP/notes.md"
+        run: |
+          printf '\nFull changelog: %s/%s/blob/main/CHANGELOG.md\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" >> "$RUNNER_TEMP/notes.md"
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           name: ${{ github.ref_name }}
