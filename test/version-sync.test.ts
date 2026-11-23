@@ -1,15 +1,20 @@
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
-import { repoRoot } from './helpers.js';
+import { afterEach, describe, expect, it } from 'vitest';
+import { repoRoot, tempDir } from './helpers.js';
 
 const script = join(repoRoot, 'scripts', 'check-version-sync.mjs');
 const name = '@developjik/sqlite-graph-mcp';
 
+const dirs: string[] = [];
+afterEach(() => {
+  while (dirs.length > 0) rmSync(dirs.pop() as string, { recursive: true, force: true });
+});
+
 function workspace(v: { pkg: string; server: string; npm: string; changelog: string }): string {
-  const dir = mkdtempSync(join(tmpdir(), 'version-sync-'));
+  const dir = tempDir('version-sync');
+  dirs.push(dir);
   writeFileSync(join(dir, 'package.json'), JSON.stringify({ name, version: v.pkg }));
   writeFileSync(
     join(dir, 'server.json'),
@@ -50,7 +55,13 @@ describe('check-version-sync', () => {
   it('fails when the tag does not match', () => {
     const r = run(workspace(synced), '--tag', 'v1.3.0');
     expect(r.status).toBe(1);
-    expect(r.stderr).toContain('git tag: 1.3.0');
+    expect(r.stderr).toContain('git tag (expected v1.2.0): v1.3.0');
+  });
+
+  it('fails on a tag without the v prefix', () => {
+    const r = run(workspace(synced), '--tag', '1.2.0');
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain('git tag (expected v1.2.0): 1.2.0');
   });
 
   it('writes only the latest CHANGELOG section as release notes', () => {
