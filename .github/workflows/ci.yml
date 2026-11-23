@@ -10,6 +10,16 @@ permissions:
   contents: read
 
 jobs:
+  version-sync:
+    name: version sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 20.x
+      - run: node scripts/check-version-sync.mjs
+
   test:
     name: test (node ${{ matrix.node }})
     runs-on: ubuntu-latest
