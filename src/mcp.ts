@@ -240,8 +240,8 @@ export function createGraphServer(options: GraphServerOptions = {}): GraphServer
         plan: z
           .union([
             z.string(),
-            z.object({ steps: z.array(z.record(z.unknown())), limit: z.number().optional() }),
-            z.array(z.record(z.unknown())),
+            z.object({ steps: z.array(z.record(z.string(), z.unknown())), limit: z.number().optional() }),
+            z.array(z.record(z.string(), z.unknown())),
           ])
           .describe('Pipeline string, step array, or {steps:[...]} object.'),
         limit: z.number().int().min(1).max(500).optional().describe('Max nodes in the answer (default 50).'),
