@@ -40,31 +40,60 @@ function findVendorFile(file: string): string | null {
   return null;
 }
 
+const LOAD_ATTEMPTS = 3;
+const LOAD_BACKOFF_MS = 250;
+
+/** One load attempt; throws when the WASM runtime or a grammar cannot load. */
+async function loadEngineOnce(): Promise<AstEngine> {
+  await Parser.init();
+  // .tsx and .jsx need the tsx grammar; plain JS/TS parse with the typescript one.
+  const typescriptWasm = findVendorFile('tree-sitter-typescript.wasm');
+  const tsxWasm = findVendorFile('tree-sitter-tsx.wasm');
+  if (!typescriptWasm || !tsxWasm) throw new Error('vendored tree-sitter grammars not found');
+  const [typescript, tsx] = await Promise.all([
+    Language.load(typescriptWasm),
+    Language.load(tsxWasm),
+  ]);
+  const forLanguage = (language: Language): LoadedGrammar => {
+    const parser = new Parser();
+    parser.setLanguage(language);
+    return { parser };
+  };
+  return { typescript: forLanguage(typescript), tsx: forLanguage(tsx) };
+}
+
+/**
+ * The Emscripten module (and a loaded grammar) occasionally fails to
+ * instantiate on a busy CI runner — a transient stderr warning from the
+ * runtime rather than a bad grammar. Retrying a few times keeps a healthy
+ * workspace from silently dropping to the regex engine for a whole process.
+ */
 async function loadEngine(): Promise<AstEngine | null> {
-  try {
-    await Parser.init();
-    // .tsx and .jsx need the tsx grammar; plain JS/TS parse with the typescript one.
-    const typescriptWasm = findVendorFile('tree-sitter-typescript.wasm');
-    const tsxWasm = findVendorFile('tree-sitter-tsx.wasm');
-    if (!typescriptWasm || !tsxWasm) return null;
-    const [typescript, tsx] = await Promise.all([
-      Language.load(typescriptWasm),
-      Language.load(tsxWasm),
-    ]);
-    const forLanguage = (language: Language): LoadedGrammar => {
-      const parser = new Parser();
-      parser.setLanguage(language);
-      return { parser };
-    };
-    return { typescript: forLanguage(typescript), tsx: forLanguage(tsx) };
-  } catch {
-    return null; // missing/incompatible WASM → heuristic engine
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= LOAD_ATTEMPTS; attempt += 1) {
+    try {
+      return await loadEngineOnce();
+    } catch (error) {
+      lastError = error;
+      if (attempt < LOAD_ATTEMPTS) {
+        await new Promise((resolve) => setTimeout(resolve, LOAD_BACKOFF_MS * attempt));
+      }
+    }
   }
+  const reason = lastError instanceof Error ? lastError.message : String(lastError);
+  process.stderr.write(`sqlite-graph-mcp: AST engine unavailable (${reason}); indexing with the heuristic engine\n`);
+  return null;
 }
 
 /** Load (once) the AST engine, or null when it is unavailable. */
 export function getAstEngine(): Promise<AstEngine | null> {
-  if (!enginePromise) enginePromise = loadEngine();
+  if (!enginePromise) {
+    enginePromise = loadEngine().then((engine) => {
+      // Never cache a failed load: a later call (or process) can still get the AST engine.
+      if (!engine) enginePromise = null;
+      return engine;
+    });
+  }
   return enginePromise;
 }
 
