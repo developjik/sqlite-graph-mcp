@@ -31,10 +31,11 @@ const sources = {
   [`server.json packages[npm ${pkg.name}].version`]: npmEntry?.version,
   'CHANGELOG.md latest heading': headings[0]?.[1],
 };
-if (values.tag !== undefined) sources['git tag'] = values.tag.replace(/^v/, '');
-
 const expected = pkg.version;
 const mismatches = Object.entries(sources).filter(([, v]) => v !== expected);
+if (values.tag !== undefined && values.tag !== `v${expected}`) {
+  mismatches.push([`git tag (expected v${expected})`, values.tag]);
+}
 
 if (mismatches.length > 0) {
   console.error(`Version mismatch (package.json is ${expected}):`);
