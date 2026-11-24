@@ -16,5 +16,6 @@ try{
  if(pkg.exports || pkg.main)run(process.execPath,['--input-type=module','-e',`await import(${JSON.stringify(pkg.name)});`],temp);
  mkdirSync(join(temp,'fixture'));writeFileSync(join(temp,'fixture','index.ts'),'export const answer = 42;\n');
  run(join(temp,'node_modules','.bin','sqlite-graph-mcp'),['index',join(temp,'fixture'),'--root',join(temp,'fixture'),'--db',join(temp,'fixture.db')],temp);
+ const found=run(join(temp,'node_modules','.bin','sqlite-graph-mcp'),['find','answer','--root',join(temp,'fixture'),'--db',join(temp,'fixture.db')],temp);if(!found.includes('answer'))throw new Error('indexed answer symbol missing');
  console.log(`${pkg.name}: production install and built runtime smoke passed on ${process.version}`);
 }finally{rmSync(temp,{recursive:true,force:true});}
