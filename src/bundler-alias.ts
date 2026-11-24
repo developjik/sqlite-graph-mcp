@@ -41,9 +41,16 @@ function aliasBlocks(source: string): string[] {
   return blocks;
 }
 
+/** Strip a leading `./` and trailing slashes from a normalized path. */
+function trimBase(path: string): string {
+  if (path === '.' || path === './') return '';
+  return path.replace(/^\.\//, '').replace(/\/+$/, '');
+}
+
 /**
  * Turn a config-relative path value into a workspace-relative base.
  * Returns null for package redirects and paths that escape the workspace.
+ * The escape check runs on the normalized path before any prefix stripping.
  */
 function replacementFor(configDir: string, value: string): string | null {
   // Only path-like values are aliases; bare names are package redirects.
@@ -51,9 +58,9 @@ function replacementFor(configDir: string, value: string): string | null {
   const joined = value.startsWith('/')
     ? posix.join('.', value)
     : posix.join(configDir || '.', value);
-  const clean = posix.normalize(joined).replace(/^\.\/?/, '').replace(/\/+$/, '');
-  if (clean === '..' || clean.startsWith('../')) return null;
-  return clean;
+  const normalized = posix.normalize(joined);
+  if (normalized === '..' || normalized.startsWith('../') || posix.isAbsolute(normalized)) return null;
+  return trimBase(normalized);
 }
 
 /**
@@ -90,7 +97,7 @@ export function resolveBundlerAlias(
   for (const { find, replacement } of aliases) {
     if (spec !== find && !spec.startsWith(`${find}/`)) continue;
     const rest = spec.slice(find.length);
-    const base = posix.normalize(posix.join(replacement || '.', `.${rest}`)).replace(/^\.\/?/, '').replace(/\/+$/, '');
+    const base = trimBase(posix.normalize(posix.join(replacement || '.', `.${rest}`)));
     const target = resolveBase(base);
     if (target) return target;
   }
