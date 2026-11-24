@@ -9,8 +9,7 @@ const resolveIn = (set: Set<string>) => (base: string) => {
 };
 
 describe('parseBundlerAliases', () => {
-  // BISECT step 2: this test is skipped to check whether it is the failing one.
-  it.skip('reads quoted and identifier keys in an object-form alias block', () => {
+  it('reads quoted and identifier keys in an object-form alias block', () => {
     const source = `export default defineConfig({
   resolve: {
     alias: {
