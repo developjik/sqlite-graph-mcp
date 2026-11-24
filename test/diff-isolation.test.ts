@@ -2,7 +2,7 @@ import * as childProcess from 'node:child_process';
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { diffWorkspaces } from '../src/diff.js';
 import { GraphStore } from '../src/db.js';
@@ -30,7 +30,7 @@ function repo():string {
   git('add','-A');git('commit','-qm','head');git('branch','collision_a');return dir;
 }
 const scratchDirs=()=>vi.mocked(mkdtempSync).mock.results
-  .filter(r=>r.type==='return' && String(r.value).includes('/sqlite-graph-diff-'))
+  .filter(r=>r.type==='return' && basename(String(r.value)).startsWith('sqlite-graph-diff-'))
   .map(r=>String(r.value)).filter(existsSync).sort();
 describe('git snapshot isolation',()=>{
   it('preserves forward, reverse and same-ref graphs with independent cleaned roots',async()=>{
