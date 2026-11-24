@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
@@ -56,10 +56,6 @@ export interface DiffOptions {
   engine?: 'ast' | 'heuristic';
   /** Cap on each list in the result (counts stay exact). Default 50. */
   limit?: number;
-}
-
-interface DiffScratch {
-  cleanup: () => void;
 }
 
 function nodeRows(store: GraphStore): Map<string, GraphNode> {
@@ -230,15 +226,14 @@ function resolveSide(
   repoRoot: string,
   spec: string,
   scratch: string,
-): { root: string; rev: string | null; cleanup: (() => void) | null } {
+): { root: string; rev: string | null } {
   const asPath = resolve(spec);
-  if (existsSync(asPath)) return { root: asPath, rev: null, cleanup: null };
+  if (existsSync(asPath)) return { root: asPath, rev: null };
   // Verify the revision before touching the filesystem; no shell anywhere.
   execFileSync('git', ['-C', repoRoot, 'rev-parse', '--verify', `${spec}^{commit}`], {
     stdio: 'pipe',
   });
-  const dir = join(scratch, spec.replace(/[^\w.-]/g, '_'));
-  mkdirSync(dir, { recursive: true });
+  const dir = mkdtempSync(join(scratch, 'snapshot-'));
   const tar = `${dir}.tar`;
   const out = execFileSync('git', ['-C', repoRoot, 'archive', '--format=tar', spec], {
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -247,7 +242,7 @@ function resolveSide(
   writeFileSync(tar, out);
   execFileSync('tar', ['-x', '-f', tar, '-C', dir]);
   rmSync(tar, { force: true });
-  return { root: dir, rev: spec, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+  return { root: dir, rev: spec };
 }
 
 /** Index both sides and diff them. `root` is the git repository for rev specs. */
@@ -258,15 +253,12 @@ export async function diffWorkspaces(
   options: DiffOptions = {},
 ): Promise<GraphDiff> {
   const scratch = mkdtempSync(join(tmpdir(), 'sqlite-graph-diff-'));
-  const cleanups: (() => void)[] = [];
   const side = (spec: string): { root: string; rev: string | null } => {
     const resolved = resolveSide(root, spec, scratch);
-    if (resolved.cleanup) cleanups.push(resolved.cleanup);
     return resolved;
   };
 
-  const baseSide = side(baseSpec);
-  const headSide = side(headSpec);
+  const stores: GraphStore[] = [];
 
   const indexSide = async (
     resolved: { root: string; rev: string | null },
@@ -279,6 +271,7 @@ export async function diffWorkspaces(
       engine: options.engine,
     });
     const store = new GraphStore(dbPath);
+    stores.push(store);
     return {
       store,
       stats,
@@ -287,14 +280,20 @@ export async function diffWorkspaces(
   };
 
   try {
+    const baseSide = side(baseSpec);
+    const headSide = side(headSpec);
     const base = await indexSide(baseSide, 'base');
     const head = await indexSide(headSide, 'head');
-    const diff = graphDiff(base.store, head.store, base.info, head.info, options);
-    base.store.close();
-    head.store.close();
-    return diff;
+    return graphDiff(base.store, head.store, base.info, head.info, options);
   } finally {
-    for (const cleanup of cleanups.reverse()) cleanup();
-    rmSync(scratch, { recursive: true, force: true });
+    let closeError: unknown;
+    try {
+      for (const store of stores.reverse()) {
+        try { store.close(); } catch (error) { closeError ??= error; }
+      }
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
+    if (closeError) throw closeError;
   }
 }
