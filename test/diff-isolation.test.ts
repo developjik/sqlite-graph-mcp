@@ -1,6 +1,6 @@
 import * as childProcess from 'node:child_process';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -8,6 +8,10 @@ import { diffWorkspaces } from '../src/diff.js';
 import { GraphStore } from '../src/db.js';
 import * as indexer from '../src/indexer.js';
 
+vi.mock('node:fs', async importOriginal => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  return {...actual, mkdtempSync:vi.fn(actual.mkdtempSync)};
+});
 vi.mock('node:child_process', async importOriginal => {
   const actual = await importOriginal<typeof import('node:child_process')>();
   return {...actual, execFileSync:vi.fn(actual.execFileSync)};
@@ -25,7 +29,9 @@ function repo():string {
   rmSync(join(dir,'base.ts'));writeFileSync(join(dir,'head.ts'),'export const headOnly = 2;');
   git('add','-A');git('commit','-qm','head');git('branch','collision_a');return dir;
 }
-const scratchDirs=()=>readdirSync(tmpdir()).filter(n=>n.startsWith('sqlite-graph-diff-')).sort();
+const scratchDirs=()=>vi.mocked(mkdtempSync).mock.results
+  .filter(r=>r.type==='return' && String(r.value).includes('/sqlite-graph-diff-'))
+  .map(r=>String(r.value)).filter(existsSync).sort();
 describe('git snapshot isolation',()=>{
   it('preserves forward, reverse and same-ref graphs with independent cleaned roots',async()=>{
     const dir=repo();
@@ -65,6 +71,18 @@ describe('git snapshot isolation',()=>{
       return (original as Function)(file,...args);
     }) as typeof original);
     await expect(diffWorkspaces(dir,'collision/a','collision_a')).rejects.toThrow('tar extraction failed');
+    expect(scratchDirs()).toEqual(before);
+  });
+  it('still closes the other store and removes scratch if a comparison close throws',async()=>{
+    const dir=repo(),before=scratchDirs();
+    const original=GraphStore.prototype.close;
+    let count=0;
+    const close=vi.spyOn(GraphStore.prototype,'close').mockImplementation(function(this:GraphStore){
+      original.call(this);count++;
+      if(count===3)throw new Error('comparison close failed');
+    });
+    await expect(diffWorkspaces(dir,'collision/a','collision_a',{engine:'heuristic'})).rejects.toThrow('comparison close failed');
+    expect(close).toHaveBeenCalledTimes(4);
     expect(scratchDirs()).toEqual(before);
   });
   it('cleans scratch on base indexing failure',async()=>{
