@@ -402,3 +402,7 @@ vendored grammars after bumping `tree-sitter-wasms` with `npm run vendor:wasm`.
 ## License
 
 MIT © 2026 Inkwon Jung ([@developjik](https://github.com/developjik))
+
+## Development baseline (DEV-128)
+
+Use Node.js 22.12.0 (`.nvmrc`) for development and CI. Vitest 5.1.1 requires Node 22.12+ on its supported release lines; Node 20.19 is outside its declared development support range. It may execute there, but CI does not treat that as supported test-runner usage. This development requirement does not change the package engine declaration. Runtime compatibility must be checked using the built package, separately from the test runner. TypeScript 7.0.2 is the development compiler baseline.
